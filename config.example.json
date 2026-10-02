@@ -1,0 +1,10 @@
+{
+  "args": [
+    "--config",
+    "/absolute/path/to/config.yaml"
+  ],
+  "env": {},
+  "pollIntervalMs": 500,
+  "requestTimeoutMs": 900000,
+  "interactionTimeoutMs": 60000
+}
