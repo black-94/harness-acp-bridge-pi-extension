@@ -149,7 +149,7 @@ npm run dev:setup         # 干净安装 + Pi 开发依赖安全修补
 npm run check              # 类型检查 + 默认测试
 npm audit --omit=dev       # 运行依赖安全检查
 npm pack --dry-run
-pi -e ./src/index.ts       # 从源码临时加载
+pi -e ./index.ts           # 从源码临时加载
 ```
 
 Pi `1.0.0` 自带 shrinkwrap，将开发依赖 `brace-expansion` 锁在有漏洞的 `5.0.9`，npm override / audit fix 无法覆盖。`npm run dev:setup` 在 `npm ci --ignore-scripts` 后执行 `fix:dev-deps`：从 npm 获取并校验 `5.0.12` 的固定 integrity，仅替换该开发依赖并同步 lockfile。修补脚本不进入发布包、不修改全局 Pi，也不在用户安装扩展时运行；上游修复后可移除。单独运行 `npm ci` 会恢复上游旧版本，之后须运行 `npm run fix:dev-deps` 再做审计。

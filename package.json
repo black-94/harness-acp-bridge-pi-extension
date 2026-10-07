@@ -1,6 +1,6 @@
 {
   "name": "@black942026/harness-acp-bridge-pi-extension",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Thin Pi client for harness-acp-bridge with reverse-request user interaction",
   "type": "module",
   "license": "MIT",
@@ -24,6 +24,7 @@
     "mcp"
   ],
   "files": [
+    "index.ts",
     "src",
     "README.md",
     "config.example.json",
@@ -31,7 +32,7 @@
   ],
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./index.ts"
     ]
   },
   "engines": {
