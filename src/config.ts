@@ -38,7 +38,9 @@ export function loadSettings(cwd: string, env = process.env): BridgeSettings {
       if (!env.PI_ACP_BRIDGE_SETTINGS && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
-    const data: unknown = JSON.parse(text);
+    let data: unknown;
+    try { data = JSON.parse(text); }
+    catch { throw new Error(`${path}: invalid JSON (check the bridge settings file)`); }
     if (!isRecord(data)) throw new Error(`${path}: expected an object`);
     for (const [key, value] of Object.entries(data)) {
       if (key === "command" || key === "cwd") {
@@ -63,7 +65,11 @@ export function loadSettings(cwd: string, env = process.env): BridgeSettings {
   } else if (!customCommand) {
     // Resolve from this extension, not the user's cwd or PATH: dependency bins
     // are not necessarily on PATH when Pi loads an installed npm package.
-    const cli = createRequire(import.meta.url).resolve("@black942026/harness-acp-bridge-server/dist/cli.js");
+    let cli: string;
+    try { cli = createRequire(import.meta.url).resolve("@black942026/harness-acp-bridge-server/dist/cli.js"); }
+    catch {
+      throw new Error("ACP bridge server dependency entry is unavailable: @black942026/harness-acp-bridge-server/dist/cli.js. Reinstall the extension or configure HARNESS_ACP_BRIDGE_SERVER with an existing built CLI path.");
+    }
     settings.args = [cli, ...settings.args];
   }
   if (env.HARNESS_ACP_BRIDGE_CONFIG) {

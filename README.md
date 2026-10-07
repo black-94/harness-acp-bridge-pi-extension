@@ -40,7 +40,9 @@ pi -e npm:@black942026/harness-acp-bridge-pi-extension
 
 配置好服务端的 harness 命令、模型与认证后再使用。不要未经检查直接启用 `yolo` 权限模式。
 
-本扩展自己建立 MCP 连接，**不需要**在 Pi 的 `mcp.json` 重复注册同一个服务。连接发生在 `session_start`；失败会提示，修好配置后可以 `/acp-connect` 重试。修改已经读取的扩展配置需要 `/reload`。
+本扩展自己建立 MCP 连接，**不需要**在 Pi 的 `mcp.json` 重复注册同一个服务。连接发生在 `session_start`；失败会提示。修复文件/权限等启动条件后可 `/acp-connect` 重试；修改已经读取的扩展配置需要先 `/reload`。
+
+启动前检查工作目录、可执行程序（含子进程 PATH）以及简单 `node <入口>` 的入口文件。错误会明确包含出错路径和原因（例如 `Invalid bridge Node entry: /path/dist/cli.js: ENOENT`），不再只有 `Connection closed`。复杂 Node 参数或 npx 等包装命令不猜测入口位置，交给实际启动诊断。MCP 握手/工具发现失败会附上最多 8192 字符的启动 stderr 前缀，脱敏凭据及配置中的已知 secret 值，不回显完整 argv/env，不混入协议 stdout；连接成功后只排空 stderr，不继续保留。错误码为 `invalid_launch`（预检查失败）或 `startup_failed`（实际启动/发现失败）。YAML 路径与语法错误来自服务端 stderr；daemon 启动错误由服务端工具原样返回。
 
 ## 配置
 

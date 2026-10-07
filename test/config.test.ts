@@ -63,6 +63,15 @@ describe("bridge settings", () => {
     writeFileSync(path, JSON.stringify(data));
     expect(() => loadSettings(dir, { PI_ACP_BRIDGE_SETTINGS: path })).toThrow();
   });
+  it("names malformed settings without exposing the invalid JSON's credentials", () => {
+    const dir = temp();
+    const path = join(dir, "settings.json");
+    writeFileSync(path, '{"TOKEN":"do-not-show-this"');
+    let error: unknown;
+    try { loadSettings(dir, { PI_ACP_BRIDGE_SETTINGS: path }); } catch (cause) { error = cause; }
+    expect(String(error)).toContain(`${path}: invalid JSON`);
+    expect(String(error)).not.toContain("do-not-show-this");
+  });
   it("reports a missing explicit config rather than silently falling back", () => {
     const dir = temp();
     expect(() => loadSettings(dir, { PI_ACP_BRIDGE_SETTINGS: "missing.json" })).toThrow();

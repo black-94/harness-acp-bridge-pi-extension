@@ -142,7 +142,7 @@ export default function acpBridgeExtension(pi: ExtensionAPI) {
       }
       for (const ref of pending.values()) monitor!.start(ref);
     } catch (error) {
-      sessionCtx.ui.notify(`ACP bridge unavailable: ${String(error)}. Configure harness-acp-bridge.json or HARNESS_ACP_BRIDGE_SERVER, then /acp-connect.`, "warning");
+      sessionCtx.ui.notify(`ACP bridge unavailable: ${String(error)}. Check the bridge executable, entry, cwd and YAML paths. If settings changed, /reload; use /acp-connect to retry.`, "warning");
     }
   });
 

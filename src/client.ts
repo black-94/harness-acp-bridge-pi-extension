@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
+import type { Readable } from "node:stream";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { isRecord, type BridgeSettings } from "./config.ts";
+import { MAX_STARTUP_STDERR_CHARS, startupFailure, validateLaunch } from "./startup.ts";
 
 const { name, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
 
@@ -36,14 +38,23 @@ export class BridgeClient implements BridgeConnection {
   }
 
   private async open(): Promise<Tool[]> {
+    const env = { ...getDefaultEnvironment(), ...this.settings.env };
+    try { validateLaunch(this.settings, env); }
+    catch (error) { throw new BridgeError("invalid_launch", startupFailure(this.settings, error)); }
     const client = new Client({ name, version });
     const transport = new StdioClientTransport({
       command: this.settings.command, args: this.settings.args, cwd: this.settings.cwd,
-      env: { ...getDefaultEnvironment(), ...this.settings.env },
-      stderr: "pipe",
+      env, stderr: "pipe",
     });
-    // Drain stderr without mixing it into the MCP stream or retaining credentials.
-    transport.stderr?.on("data", () => {});
+    // Keep a bounded startup prefix, then redact the combined text on exposure
+    // (keys/values may span chunks). After discovery only drain, never retain.
+    let stderr = "";
+    let collecting = true;
+    const stderrStream = transport.stderr as Readable | null;
+    stderrStream?.setEncoding("utf8");
+    stderrStream?.on("data", (chunk: string) => {
+      if (collecting) stderr += chunk.slice(0, MAX_STARTUP_STDERR_CHARS - stderr.length);
+    });
     this.client = client;
     this.transport = transport;
     client.onclose = () => {
@@ -67,8 +78,12 @@ export class BridgeClient implements BridgeConnection {
       return tools;
     } catch (error) {
       await client.close().catch(() => {});
+      await transport.close().catch(() => {});
       if (this.client === client) { this.client = undefined; this.transport = undefined; }
-      throw error;
+      throw new BridgeError("startup_failed", startupFailure(this.settings, error, stderr));
+    } finally {
+      collecting = false;
+      stderr = "";
     }
   }
 
