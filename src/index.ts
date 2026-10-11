@@ -7,27 +7,70 @@ import { isRecord, loadSettings } from "./config.ts";
 import { InteractionRouter } from "./interactions.ts";
 import { ServerLifecycle } from "./lifecycle.ts";
 import { MessageMonitor, type MessageRef } from "./monitor.ts";
+import { collectSecrets, redactValue } from "./redact.mjs";
 import { renderAcpResult } from "./render.ts";
 import { OUTPUT_SCHEMA, TOOL_SPECS, WAIT_SCHEMA } from "./schemas.ts";
 
 const watchEntry = "harness-acp-bridge-watch";
 
 /** Final, model-facing result: the terminal message status only, never the UI preview. */
-function toolResult(data: Record<string, unknown>): AgentToolResult<Record<string, unknown>> {
+function toolResult(data: Record<string, unknown>, secrets: readonly string[]): AgentToolResult<Record<string, unknown>> {
   const full = JSON.stringify(data, null, 2);
   let text = full;
   if (full.length > 20_000) {
     const path = join(mkdtempSync(join(tmpdir(), "pi-acp-")), "result.json");
-    writeFileSync(path, full, { mode: 0o600 });
+    // Only the persisted copy is sanitized: recursive sensitive-key masking, textual credential
+    // patterns, and known sensitive env literals. The returned context keeps the real business
+    // response (policy permits the raw HTTP body in memory); the preview never appears here.
+    writeFileSync(path, `${JSON.stringify(redactValue(data, secrets), null, 2)}\n`, { mode: 0o600 });
     text = `${full.slice(0, 10_000)}\n… truncated …\n${full.slice(-8_000)}\nFull result: ${path}`;
   }
   const structuredContent = JSON.parse(full) as NonNullable<AgentToolResult<Record<string, unknown>>["structuredContent"]>;
   return { content: [{ type: "text" as const, text }], details: data, structuredContent };
 }
 
-/** UI-only progress update: empty content, preview in details, so it never enters the transcript. */
+/**
+ * UI-only progress update: never enters the transcript, and never carries preview text.
+ *
+ * `content` is a single empty text block instead of `[]`, and `structuredContent` is present
+ * (empty): host and third-party tool bridges commonly assume a partial result has a text block
+ * and structured data (`partialResult.content[0].text.length`,
+ * `JSON.stringify(partialResult.structuredContent).length`). An empty array or a missing
+ * `structuredContent` makes those readers throw a `TypeError` that the host attributes to the
+ * tool call, while the remote message keeps running. The rolling preview lives only in
+ * `details.preview` for the renderer; it is never in `content` or `structuredContent`.
+ *
+ * `details.activity` is a small, sanitized projection of the server's status metrics (phase,
+ * elapsed-since-progress, stall hint). It is UI-only metadata, never preview text.
+ */
 function previewUpdate(status: Record<string, unknown>, preview: string): AgentToolResult<Record<string, unknown>> {
-  return { content: [], details: { state: status.state, preview } };
+  const activity = activityDetails(status);
+  return {
+    content: [{ type: "text" as const, text: "" }],
+    details: {
+      state: status.state,
+      preview,
+      // The message id belongs to the result, not to the activity metrics, so it is present even
+      // when no activity is reported. The renderer reads `details.message_id`.
+      ...(typeof status.message_id === "string" ? { message_id: status.message_id } : {}),
+      ...(activity ? { activity } : {}),
+    },
+    structuredContent: {},
+  };
+}
+
+/** Copy only whitelisted, non-preview **activity** fields (never `message_id`) into `details.activity`. */
+function activityDetails(status: Record<string, unknown>): Record<string, unknown> | undefined {
+  const activity = isRecord(status.activity) ? status.activity : undefined;
+  if (!activity) return undefined;
+  const picked: Record<string, unknown> = {};
+  // Keep the server's field name so server, renderer, and docs agree.
+  if (typeof activity.observed_phase === "string") picked.observed_phase = activity.observed_phase;
+  if (typeof activity.seconds_since_progress === "number") picked.seconds_since_progress = activity.seconds_since_progress;
+  if (typeof activity.last_progress_at === "string") picked.last_progress_at = activity.last_progress_at;
+  if (typeof activity.stalled === "boolean") picked.stalled = activity.stalled;
+  if (typeof activity.stall_hint_seconds === "number") picked.stall_hint_seconds = activity.stall_hint_seconds;
+  return Object.keys(picked).length ? picked : undefined;
 }
 
 /**
@@ -45,6 +88,9 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
   let ctx: ExtensionContext | undefined;
   let initializing: Promise<void> | undefined;
   let ensured: Promise<void> | undefined;
+  // Literal secret values from sensitive-named env keys, masked wherever they appear in a
+  // persisted oversized result. Kept in memory only, never written.
+  const secrets = collectSecrets(process.env);
 
   const remember = (ref: MessageRef, active: boolean): void => pi.appendEntry(watchEntry, { ...ref, active });
   const startWatch = (ref: MessageRef): void => {
@@ -81,9 +127,11 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
     onUpdate: ((result: AgentToolResult<Record<string, unknown>>) => void) | undefined,
   ) => {
     const result = await monitor!.wait(ref, toolCtx, signal, (status, preview) => {
-      onUpdate?.(previewUpdate(status, preview));
+      // Return the host callback's value (possibly a promise) so the monitor's presentation guard
+      // can attach to a rejection; otherwise an async-rejecting onUpdate becomes unhandled.
+      return onUpdate?.(previewUpdate(status, preview));
     });
-    return { ...toolResult({ ...result, ...ref }), ...(result.state === "failed" ? { isError: true } : {}) };
+    return { ...toolResult({ ...result, ...ref }, secrets), ...(result.state === "failed" ? { isError: true } : {}) };
   };
 
   for (const tool of TOOL_SPECS) {
@@ -111,7 +159,7 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
       async execute(_id, args, signal) {
         await ensureServer();
         const data = await client!.call(tool.name, args as Record<string, unknown>, signal);
-        return toolResult(data);
+        return toolResult(data, secrets);
       },
     });
   }

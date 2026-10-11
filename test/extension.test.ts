@@ -125,11 +125,15 @@ describe("Pi tools over the HTTP bridge", () => {
       expect(JSON.stringify(result.content)).not.toContain(SENTINEL);
       expect(JSON.stringify(result.structuredContent)).not.toContain(SENTINEL);
       expect(JSON.stringify(result.details)).not.toContain(SENTINEL);
-      // Preview is delivered as a UI-only update: empty content, preview in details.
+      // Preview is delivered as a UI-only update: a contract-shaped partial result with a single
+      // empty text block plus an empty structured object, preview only in details.
       const previewUpdate = updates.find(update => JSON.stringify(update.details ?? {}).includes(SENTINEL));
       expect(previewUpdate).toBeDefined();
-      expect(previewUpdate!.content).toEqual([]);
-      expect(previewUpdate!.structuredContent).toBeUndefined();
+      expect(previewUpdate!.content).toEqual([{ type: "text", text: "" }]);
+      expect(previewUpdate!.structuredContent).toEqual({});
+      // The partial update itself must not carry the preview into any model-facing field.
+      expect(JSON.stringify(previewUpdate!.content)).not.toContain(SENTINEL);
+      expect(JSON.stringify(previewUpdate!.structuredContent)).not.toContain(SENTINEL);
       expect(host.messages).not.toHaveBeenCalled();
     } finally { await host.cleanup(); }
   });
@@ -174,6 +178,24 @@ describe("Pi tools over the HTTP bridge", () => {
       // The final render shows the settled answer, still UI-only.
       const final = { content: [{ type: "text", text: "ANSWER" }], details: { state: "completed", result: { text: "final:hello" } } } as unknown as AgentToolResult<Record<string, unknown>>;
       expect((send.renderResult!(final, { isPartial: false } as never, theme, {} as never) as { render(width: number): string[] }).render(80).join("\n")).toContain("final:hello");
+
+      // Critical risk info must be visible at narrow widths, not only on a very wide terminal.
+      const active = { content: [{ type: "text", text: "" }], details: { state: "running", message_id: "msg_abcdef", preview: "PREVIEW-BODY", activity: { observed_phase: "tool_use", seconds_since_progress: 5, stalled: true } } } as unknown as AgentToolResult<Record<string, unknown>>;
+      for (const width of [40, 80]) {
+        const joined = render(active, width).join("\n");
+        expect(joined).toContain("stalled");
+        expect(joined).toContain("tool_use");
+        expect(joined).toContain("PREVIEW-BODY");
+        for (const line of render(active, width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+      // Waiting on the user shows needs-input, never a stall.
+      const waiting = { content: [{ type: "text", text: "" }], details: { state: "waiting_input", preview: "Q?", activity: { observed_phase: "waiting_input", seconds_since_progress: 99, stalled: false } } } as unknown as AgentToolResult<Record<string, unknown>>;
+      for (const width of [40, 80]) {
+        const joined = render(waiting, width).join("\n");
+        expect(joined).toContain("needs input");
+        expect(joined).not.toContain("stalled");
+        for (const line of render(waiting, width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      }
     } finally { await host.cleanup(); }
   });
 

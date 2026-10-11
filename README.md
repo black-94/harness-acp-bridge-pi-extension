@@ -77,9 +77,13 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
    本地 spawn，也不经 SSH 启动。
 4. 启动由客户端目录下按地址加锁串行化，随后重新探测，两个客户端并发启动同一实例会收敛到一个
    服务（服务端自身的 `state_dir` 锁与端口绑定是最终兜底）。
-5. 所启动服务以 detached、无继承 stdio 方式运行：它独立于客户端存活，且**客户端永不主动 kill
-   它**，因此不会误伤其他客户端的会话或复用实例。它的 pid 与日志记在
-   `<client dir>/servers.json`（默认 `~/.harness-acp-bridge-client`），诊断来自其日志且已脱敏。
+5. 所启动服务作为**分离式日志 supervisor** 的子进程运行：supervisor 把服务的真实 stdout/stderr
+   fd 接成 **pipe**（而非日志文件），两路独立、跨 chunk 有界地脱敏后再 append 到日志。因此它独立
+   于客户端存活，且**客户端永不主动 kill 它**，不会误伤其他客户端会话或复用实例。
+   `<client dir>/servers.json`（默认 `~/.harness-acp-bridge-client`）记录真实 server pid、supervisor
+   pid 与日志路径。所有权是**证明**而非猜测：客户端用新 nonce 启动 supervisor，仅当应答 ping 的
+   pid 等于 supervisor 记录的 `server_pid`、且私有 proof 文件携带该 nonce 时才 claim；抢赢的
+   peer 被复用，外来监听者绝不被当作“无人监听”、也绝不被 kill。
 6. `shutdown`/`reload` 只释放客户端自身的连接，**不关闭已有服务端会话，也不停止复用实例**。
 
 ## 工具
@@ -118,15 +122,47 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
   调用 `acp_answer_question` 后再 `acp_wait`。
 - 关闭弹窗 → `answer: cancel`；到期 → `answer: timeout`；服务端决定继续还是取消消息。
 - 中止 Pi 的等待工具（工具取消 / `signal`）→ 调用 `cancel_message` 取消当前远端消息。
-- **预览仅用于 UI**：等待期间通过工具更新的 `content: []` + `details.preview` 传递预览，并由
-  `acp_send_message`/`acp_wait` 的自定义 `renderResult` 渲染（Pi 默认不展示 `details`；终态排空剩余
-  分页后也会刷新一次 UI）。预览**不进入**模型上下文，也**不**出现在 `send_message`/`wait` 最终返回的
-  `content`、`structuredContent` 或可持久化数据里。最终答案来自 `message_status.result`；需要增量输出时
-  显式调用 `acp_live_output`。
+- **预览与活动仅用于 UI**：等待期间通过工具更新的 `content: [{ type: "text", text: "" }]`、
+  `structuredContent: {}`、`details.preview` 传递预览与服务器活动指标（`details.activity`：
+  `observed_phase`、`seconds_since_progress`、`stalled` 等），由 `acp_send_message`/`acp_wait` 的自定义
+  `renderResult` 渲染（Pi 默认不展示 `details`；终态排空剩余分页后也会刷新一次 UI）。运行中表头
+  显示最后观测阶段与「距上次进展 X 秒 / 疑似停滞」；`running` 仅表示「仍在等待 ACP 结果」，
+  **不保证模型仍在推进**。预览与活动**不进入**模型上下文，也**不**出现在 `send_message`/`wait`
+  最终返回的 `content`、`structuredContent` 或可持久化数据里。最终答案来自 `message_status.result`；
+  需要增量输出时显式调用 `acp_live_output`。
 - `failed` 终态作为工具错误返回。超过 20,000 字符的结果写入权限 0600 的临时 JSON 文件，工具文本
   附路径，结构化结果保留完整数据。
 - shutdown/reload 停止本地轮询、关闭弹窗，不隐式关闭服务端会话、不停止复用服务；分支内已保存的
   未完成 `message_id` 会在重载后恢复监控。
+
+## 隐私
+
+扩展对真实 HTTP 响应照常返回，**只脱敏它自己写到磁盘的副本**，且只处理常见凭据形态。
+
+- 分离式 bootstrap 是**日志 supervisor**：它以 stdout/stderr 为 **pipe**（绝非日志文件）启动真正的
+  服务，并把两路独立、跨 chunk 有界地脱敏后 append 到 `server-<addr>.log`。因为真实 fd 是 pipe，
+  所有输出路径都被覆盖：`console`、`stream.write`、**`fs.writeSync(1/2)`**、`fs.writev`、原生模块、
+  动态 import 与运行时诊断。JS 层 patch `write` 看不到 fd 级写入，pipe 边界可以。
+- 脱敏完全在分离式 supervisor 内，不在客户端，因此客户端退出后仍持续工作；EOF 时两路滞留尾部先
+  脱敏 flush 再关日志 fd；日志只 append，绝不改写已有字节。
+- 脱敏或磁盘错误绝不回退为明文：脱敏异常丢弃该 chunk，磁盘写入失败则停止自有服务并以非零退出，
+  既不无限重试，也不让服务端因 pipe 满而永久阻塞。
+- `logTail` 与 registry 的读时遮盖只是纵深防御，不是安全边界。
+- `servers.json` 在原子写入前先脱敏；顶层 map key 是 baseUrl（本身已校验无凭据）并原样保留，
+  保证 registry 与所有权探测可用。日志文件为 0600、位于 0700 客户端目录，launcher proof 文件 0600。
+- 规则来自 server 的规范源文件：`src/redact-core.mjs` / `src/redact.mjs` 由
+  `server/src/redact-core.ts`（sha256 `b07ef16e39483b008c0f03e3da05dc194c87fa93080b53accf34317586d2a6c8`）
+  与 `server/src/redact.ts`（sha256 `fa8e4bfedee21dd2c8014544cb8a9daacf8378c83fba874a8ad1714cf7fa450f`）
+  经 `tsc` 转译得到，**唯一改动是把内部 `./redact-core.js` import 改成 `.mjs`**；`redact-core.d.mts` /
+  `redact.d.mts` 同为生成的声明。无运行时跨仓库 import，普通 Node（>=20.11）直接运行、无需 TS loader。
+  重新同步：对 server 的两个 TS 跑 `tsc --outDir <tmp> --target ES2022 --module ES2022
+  --moduleResolution node --declaration`，把 `redact-core.js`/`redact.js` 的 `.js` 改为 `.mjs` 后拷入 `src/`。
+- 跨包 parity harness（仓库根 `scripts/redaction-parity.mjs`）同时加载 server、MCP、Pi 三个模块，
+  对非流式与流式 API 做逐字节一致性校验（报告：`/tmp/redaction-parity-final.log`）。
+- 只识别常见敏感字段/正文凭据：未知/未识别文本（含 `max_tokens` 这类计数、普通中文/emoji）
+  原样保留；不保证清除所有未知秘密。
+- 超大 toolResult（>20000 字符）落盘前递归脱敏：临时目录 700、结果文件 600；内存中返回给模型
+  的业务语义不变，preview 仍只存在于 `details.preview`。
 
 ## 开发与验证
 

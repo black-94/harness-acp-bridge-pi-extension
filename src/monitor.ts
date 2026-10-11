@@ -15,7 +15,9 @@ import { InteractionRouter, type Question } from "./interactions.ts";
 export interface MessageRef { session_id: string; message_id: string }
 interface Waiter {
   ctx: ExtensionToolContext;
-  update?: (status: Record<string, unknown>, preview: string) => void;
+  // Returns `unknown`, not `void`: the host `onUpdate` sink may return a promise, and the caller
+  // must hand it back so `guard` can consume a rejection instead of leaking an unhandled one.
+  update?: (status: Record<string, unknown>, preview: string) => unknown;
   resolve: (status: Record<string, unknown>) => void;
   reject: (error: unknown) => void;
 }
@@ -36,6 +38,26 @@ interface Watch {
 const PREVIEW_LIMIT = 16_384;
 const PREVIEW_PAGE_EVENTS = 100;
 const MAX_DRAIN_PAGES = 1000;
+
+/**
+ * Run a progress or UI side effect so it can never affect message monitoring.
+ *
+ * A host renderer, status sink, or notification is presentation, not business logic: a throwing
+ * one must not reject an unrelated waiter, must not fail a message that already reached its
+ * terminal state, and must not stop polling a still-running remote message. Synchronous throws
+ * are swallowed; a returned promise has its rejection consumed so no unhandled rejection is
+ * created. Genuine failures are deliberately NOT routed through here and keep their normal reject
+ * semantics: network and server calls, reverse-request interactions, and watch persistence
+ * (`onSettled` → `pi.appendEntry`). `guard` is only for presentation.
+ */
+function guard(effect: () => unknown): void {
+  try {
+    const result = effect();
+    if (result && typeof (result as Promise<unknown>).then === "function") {
+      (result as Promise<unknown>).then(undefined, () => {});
+    }
+  } catch { /* presentation-only: never break monitoring or the remote task */ }
+}
 
 export class MessageMonitor {
   private watches = new Map<string, Watch>();
@@ -64,11 +86,13 @@ export class MessageMonitor {
     watch.done = this.loop(watch).catch(error => {
       watch.error = error;
       for (const waiter of watch.waiters) waiter.reject(error);
-      if (!this.stopped && watch.waiters.size === 0) this.ctx.ui.notify(`ACP monitor: ${String(error)}`, "warning");
+      if (!this.stopped && watch.waiters.size === 0) guard(() => this.ctx.ui.notify(`ACP monitor: ${String(error)}`, "warning"));
     }).finally(async () => {
       watch.prompt?.controller.abort();
       await watch.prompt?.done.catch(() => {});
-      this.ctx.ui.setStatus(`acp:${key}`, undefined);
+      // The status sink is presentation: a stale/invalid UI context must still let the watch be
+      // removed, or every later wait for this message would replay this watch's stored error.
+      guard(() => this.ctx.ui.setStatus(`acp:${key}`, undefined));
       this.watches.delete(key);
     });
     return watch;
@@ -99,7 +123,7 @@ export class MessageMonitor {
       if (signal?.aborted && !this.stopped) {
         // Tool cancellation cancels the remote message, not just the local polling call.
         await this.client.call("cancel_message", { ...ref }).catch(cancelError => {
-          this.ctx.ui.notify(`ACP cancellation failed; message may still be running: ${String(cancelError)}`, "warning");
+          guard(() => this.ctx.ui.notify(`ACP cancellation failed; message may still be running: ${String(cancelError)}`, "warning"));
         });
       }
       throw error;
@@ -140,7 +164,7 @@ export class MessageMonitor {
     const signal = watch.controller.signal;
     while (!signal.aborted) {
       const status = await this.client.call("message_status", { ...ref }, signal);
-      this.ctx.ui.setStatus(`acp:${this.key(ref)}`, `ACP ${ref.message_id}: ${String(status.state)}`);
+      guard(() => this.ctx.ui.setStatus(`acp:${this.key(ref)}`, `ACP ${ref.message_id}: ${String(status.state)}`));
       const question = this.currentQuestion(status);
       if (watch.prompt && (status.terminal === true || question?.request_id !== watch.prompt.id)) {
         watch.prompt.controller.abort();
@@ -152,11 +176,14 @@ export class MessageMonitor {
         // UI render the final preview before the terminal status settles.
         await this.pump(watch, signal).catch(() => {});
         watch.result = status;
+        // `onSettled` persists watch bookkeeping (`pi.appendEntry`), not presentation: a genuine
+        // failure must surface through the watch error path rather than be swallowed by `guard`.
         this.onSettled(ref);
-        for (const waiter of watch.waiters) waiter.update?.(status, watch.preview);
+        // Presentation only; one waiter's throwing/async-rejecting renderer must not fail the rest.
+        for (const waiter of watch.waiters) guard(() => waiter.update?.(status, watch.preview));
         for (const waiter of watch.waiters) waiter.resolve(status);
         if (watch.waiters.size === 0 && this.ctx.hasUI) {
-          this.ctx.ui.notify(`ACP ${ref.message_id}: ${String(status.state)}. Read with acp_message_status.`, status.state === "failed" ? "warning" : "info");
+          guard(() => this.ctx.ui.notify(`ACP ${ref.message_id}: ${String(status.state)}. Read with acp_message_status.`, status.state === "failed" ? "warning" : "info"));
         }
         return;
       }
@@ -182,15 +209,19 @@ export class MessageMonitor {
         })().catch(error => {
           if (controller.signal.aborted || signal.aborted) return;
           watch.unhandled.add(id);
+          // The interaction failure is real: reject the waiters. Only the advisory notification is
+          // presentation, so a throwing UI must not turn one failed answer into an unhandled error.
           for (const waiter of watch.waiters) waiter.reject(error);
-          this.ctx.ui.notify(`ACP interaction remains pending: ${String(error)}. Use acp_answer_question or retry acp_wait.`, "warning");
+          guard(() => this.ctx.ui.notify(`ACP interaction remains pending: ${String(error)}. Use acp_answer_question or retry acp_wait.`, "warning"));
         });
         watch.prompt = { id, controller, done };
         void done.finally(() => { if (watch.prompt?.controller === controller) watch.prompt = undefined; });
       }
       if (watch.waiters.size > 0) {
         await this.pump(watch, signal);
-        for (const waiter of watch.waiters) waiter.update?.(status, watch.preview);
+        // A progress renderer is presentation: isolate each waiter so one bad update cannot stop
+        // polling a still-running remote message or fail a sibling waiter.
+        for (const waiter of watch.waiters) guard(() => waiter.update?.(status, watch.preview));
       }
       await delay(this.pollIntervalMs, undefined, { signal });
     }

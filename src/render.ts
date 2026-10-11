@@ -29,7 +29,9 @@ function component(theme: Theme, header: string, body: string): { render(width: 
     render(width: number): string[] {
       const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
       if (safeWidth <= 0) return [""];
-      const lines = [truncateToWidth(theme.fg("dim", header), safeWidth, ELLIPSIS)];
+      // The header may be several prioritized lines; each is truncated independently so a long
+      // detail line cannot push the short risk line off-screen at narrow widths.
+      const lines = header.split("\n").map(line => truncateToWidth(theme.fg("dim", line), safeWidth, ELLIPSIS));
       const bodyLines: string[] = [];
       for (const raw of body === "" ? [] : body.split("\n")) {
         for (const piece of wrapLine(theme.fg("toolOutput", raw), safeWidth)) bodyLines.push(piece);
@@ -53,6 +55,28 @@ function finalText(result: AgentToolResult<Record<string, unknown>>): string {
     .join("\n");
 }
 
+/**
+ * Header for a live (partial) result, as up to three prioritized lines.
+ *
+ * A running tool means "waiting for the ACP result", not "the model is progressing". Line 1 is the
+ * state plus the single most important risk (`needs input` while waiting on the user, or
+ * `⚠ possibly stalled`), kept short so it survives truncation at 40/80 columns. Line 2 is the
+ * activity (`observed_phase` + elapsed). Line 3 is the full message id on its own line so it is
+ * truncated independently and can never push the phase or elapsed time off-screen; a long id is
+ * clipped but its prefix stays visible. All of this is presentation only.
+ */
+function partialHeader(details: Record<string, unknown>, state: string): string {
+  const activity = isRecord(details.activity) ? details.activity : undefined;
+  const risk = state === "waiting_input" ? "needs input" : activity?.stalled === true ? "⚠ possibly stalled" : null;
+  const lines = [risk ? `ACP ${state} · ${risk}` : `ACP ${state}`];
+  const activityBits: string[] = [];
+  if (activity && typeof activity.observed_phase === "string") activityBits.push(activity.observed_phase);
+  if (activity && typeof activity.seconds_since_progress === "number") activityBits.push(`${Math.round(activity.seconds_since_progress)}s since progress`);
+  if (activityBits.length) lines.push(activityBits.join(" · "));
+  if (typeof details.message_id === "string") lines.push(details.message_id);
+  return lines.join("\n");
+}
+
 /** Custom Pi tool renderer: preview while running, final answer once settled. */
 export function renderAcpResult(
   result: AgentToolResult<Record<string, unknown>>,
@@ -62,7 +86,7 @@ export function renderAcpResult(
   const details = isRecord(result.details) ? result.details : {};
   const state = typeof details.state === "string" ? details.state : options.isPartial ? "running" : "done";
   if (options.isPartial) {
-    return component(theme, `ACP ${state}`, typeof details.preview === "string" ? details.preview : "");
+    return component(theme, partialHeader(details, state), typeof details.preview === "string" ? details.preview : "");
   }
   return component(theme, `ACP ${state}`, finalText(result));
 }
