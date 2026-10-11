@@ -157,7 +157,7 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
   `redact.d.mts` 同为生成的声明。无运行时跨仓库 import，普通 Node（>=20.11）直接运行、无需 TS loader。
   重新同步：对 server 的两个 TS 跑 `tsc --outDir <tmp> --target ES2022 --module ES2022
   --moduleResolution node --declaration`，把 `redact-core.js`/`redact.js` 的 `.js` 改为 `.mjs` 后拷入 `src/`。
-- 跨包 parity harness（仓库根 `scripts/redaction-parity.mjs`）同时加载 server、MCP、Pi 三个模块，
+- 跨包 parity harness（仓库根 `scripts/tests/redaction-parity.mjs`）同时加载 server、MCP、Pi 三个模块，
   对非流式与流式 API 做逐字节一致性校验（报告：`/tmp/redaction-parity-final.log`）。
 - 只识别常见敏感字段/正文凭据：未知/未识别文本（含 `max_tokens` 这类计数、普通中文/emoji）
   原样保留；不保证清除所有未知秘密。
