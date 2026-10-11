@@ -1,10 +1,10 @@
 {
-  "args": [
-    "--config",
-    "/absolute/path/to/config.yaml"
-  ],
-  "env": {},
-  "pollIntervalMs": 500,
+  "baseUrl": "http://127.0.0.1:8787",
   "requestTimeoutMs": 900000,
-  "interactionTimeoutMs": 60000
+  "interactionTimeoutMs": 60000,
+  "pollIntervalMs": 500,
+  "autoStart": true,
+  "serverEntry": null,
+  "configPath": null,
+  "startupTimeoutMs": 30000
 }

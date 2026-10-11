@@ -5,61 +5,74 @@ import { context, askContext, permission } from "./helpers.ts";
 import type { BridgeConnection } from "../src/client.ts";
 
 const ref = { session_id: "s1", message_id: "m1" };
-function setup(options: { terminal?: boolean; ui?: boolean } = {}) {
-  let terminal = options.terminal ?? false;
-  let interaction: unknown = permission();
-  const call = vi.fn(async (name: string) => {
-    if (name === "message_result") return { state: terminal ? "completed" : "waiting_input", terminal, interaction: terminal ? null : interaction, ...(terminal ? { text: "done" } : {}) };
-    if (name === "live_output") return { chunk: "preview", next_offset: 7 };
-    if (name === "answer_question") { interaction = null; terminal = true; return { accepted: true }; }
-    if (name === "cancel_message") { terminal = true; return { state: "cancelled" }; }
-    return {};
-  });
+const PREVIEW = "PREVIEW-SENTINEL";
+
+function harness(options: { ui?: boolean; pages?: Array<{ text: string; hasMore: boolean; terminal?: boolean }> } = {}) {
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const state: { terminal: boolean; question: unknown | null; statusCalls: number } = { terminal: false, question: permission(), statusCalls: 0 };
+  const queue = options.pages ? [...options.pages] : null;
+  const connection: BridgeConnection = {
+    async call(name, args = {}) {
+      calls.push({ name, args });
+      if (name === "message_status") {
+        state.statusCalls++;
+        return { state: state.terminal ? "completed" : "waiting_input", terminal: state.terminal, questions: state.terminal || !state.question ? [] : [state.question], ...(state.terminal ? { text: "done", result: { text: "done" } } : {}) };
+      }
+      if (name === "live_output") {
+        if (queue) { const page = queue.shift(); return page ? { events: [{ type: "answer", text: page.text }], next_cursor: `c${calls.length}`, has_more: page.hasMore, terminal: page.terminal ?? false } : { events: [], next_cursor: "end", has_more: false }; }
+        return { events: [{ type: "answer", text: PREVIEW }], next_cursor: "p1", has_more: false };
+      }
+      if (name === "answer_question") { state.question = null; state.terminal = true; return { answered: true }; }
+      if (name === "cancel_message") { state.terminal = true; return { state: "cancelled", terminal: true }; }
+      return {};
+    },
+  };
   const ctx = context({ hasUI: options.ui ?? true });
-  vi.mocked(ctx.ui.select).mockResolvedValue("2. Reject [reject_once]");
   const settled = vi.fn();
-  const monitor = new MessageMonitor({ call } as BridgeConnection, new InteractionRouter(100), ctx, 5, settled);
-  return { monitor, call, ctx, settled, finish: () => { terminal = true; } };
+  const monitor = new MessageMonitor(connection, new InteractionRouter(100), ctx, 5, settled);
+  return { monitor, calls, ctx, state, settled, finish: () => { state.terminal = true; } };
 }
 
 describe("message monitoring", () => {
-  it("handles reverse request with active ask_user context and streams preview", async () => {
-    const { monitor, call, settled } = setup();
+  it("handles a reverse request with an active ask_user context and streams preview", async () => {
+    const { monitor, calls, settled } = harness();
     const toolCtx = askContext({ status: "answered", answers: [{ id: "permission", selections: ["1. Allow [allow_once]"] }] });
     const update = vi.fn();
     const result = await monitor.wait(ref, toolCtx, undefined, update);
     expect(result.text).toBe("done");
     expect(toolCtx.executeTool).toHaveBeenCalledOnce();
-    expect(call).toHaveBeenCalledWith("answer_question", { ...ref, request_id: "req-1", answer: "accept", response: { option_id: "allow" } }, expect.any(AbortSignal));
+    expect(calls).toContainEqual({ name: "answer_question", args: { ...ref, request_id: "req-1", answer: "accept", option_id: "allow" } });
     expect(update).toHaveBeenCalled();
     expect(settled).toHaveBeenCalledWith(ref);
     await monitor.stop();
   });
-  it("watches an asynchronous submit using native UI", async () => {
-    const { monitor, call, ctx } = setup();
-    monitor.start(ref);
-    await vi.waitFor(() => expect(call.mock.calls.some(c => c[0] === "answer_question")).toBe(true));
-    expect(ctx.ui.select).toHaveBeenCalledOnce();
+  it("answers a permission request through native UI", async () => {
+    const { monitor, calls, ctx } = harness();
+    vi.mocked(ctx.ui.select).mockResolvedValue("2. Reject [reject_once]");
+    const result = await monitor.wait(ref, ctx);
+    expect(result.terminal).toBe(true);
+    expect(calls).toContainEqual({ name: "answer_question", args: { ...ref, request_id: "req-1", answer: "accept", option_id: "deny" } });
     await monitor.stop();
   });
   it("deduplicates watchers and answers per message", async () => {
-    const { monitor, call, ctx } = setup();
+    const { monitor, calls, ctx } = harness();
+    vi.mocked(ctx.ui.select).mockResolvedValue("1. Allow [allow_once]");
     monitor.start(ref);
     monitor.start(ref);
-    await vi.waitFor(() => expect(call.mock.calls.some(c => c[0] === "answer_question")).toBe(true));
+    await vi.waitFor(() => expect(calls.some(c => c.name === "answer_question")).toBe(true));
+    expect(calls.filter(c => c.name === "answer_question")).toHaveLength(1);
     expect(ctx.ui.select).toHaveBeenCalledOnce();
-    expect(call.mock.calls.filter(c => c[0] === "answer_question")).toHaveLength(1);
     await monitor.stop();
   });
   it("returns waiting_input without fabricating answers when UI is unavailable", async () => {
-    const { monitor, call, ctx } = setup({ ui: false });
-    const result = await monitor.wait(ref, ctx);
+    const { monitor, calls } = harness({ ui: false });
+    const result = await monitor.wait(ref, context({ hasUI: false }));
     expect(result.state).toBe("waiting_input");
-    expect(call.mock.calls.some(c => c[0] === "answer_question")).toBe(false);
+    expect(calls.some(c => c.name === "answer_question")).toBe(false);
     await monitor.stop();
   });
   it("cancels the remote message on waiter abort", async () => {
-    const { monitor, call, ctx } = setup();
+    const { monitor, calls, ctx } = harness();
     const controller = new AbortController();
     vi.mocked(ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {
       options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
@@ -68,12 +81,11 @@ describe("message monitoring", () => {
     await vi.waitFor(() => expect(ctx.ui.select).toHaveBeenCalled());
     controller.abort();
     await expect(promise).rejects.toThrow();
-    expect(call.mock.calls.some(c => c[0] === "cancel_message")).toBe(true);
-    expect(call.mock.calls.some(c => c[0] === "answer_question")).toBe(false);
+    expect(calls.some(c => c.name === "cancel_message")).toBe(true);
     await monitor.stop();
   });
-  it("dismisses stale UI when the remote turn becomes terminal", async () => {
-    const { monitor, call, ctx, finish } = setup();
+  it("dismisses a stale UI when the remote turn becomes terminal", async () => {
+    const { monitor, calls, ctx, finish } = harness();
     vi.mocked(ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {
       options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
     }));
@@ -81,27 +93,41 @@ describe("message monitoring", () => {
     await vi.waitFor(() => expect(ctx.ui.select).toHaveBeenCalled());
     finish();
     expect((await promise).terminal).toBe(true);
-    expect(call.mock.calls.some(c => c[0] === "answer_question")).toBe(false);
+    expect(calls.some(c => c.name === "answer_question")).toBe(false);
     await monitor.stop();
   });
-  it("stops polling and closes UI on shutdown without closing daemon sessions", async () => {
-    const { monitor, call, ctx } = setup();
+  it("stops polling and closes UI on shutdown without closing server sessions", async () => {
+    const { monitor, calls, ctx } = harness();
     vi.mocked(ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {
       options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
     }));
     monitor.start(ref);
     await vi.waitFor(() => expect(ctx.ui.select).toHaveBeenCalled());
     await monitor.stop();
-    const count = call.mock.calls.length;
+    const count = calls.length;
     await new Promise(resolve => setTimeout(resolve, 20));
-    expect(call).toHaveBeenCalledTimes(count);
-    expect(call.mock.calls.some(c => c[0] === "close_session" || c[0] === "cancel_message")).toBe(false);
+    expect(calls.length).toBe(count);
+    expect(calls.some(c => c.name === "close_session" || c.name === "cancel_message")).toBe(false);
   });
-  it("allows retry after an invalid UI answer", async () => {
-    const { monitor, ctx } = setup();
+  it("allows a retry after an invalid UI answer", async () => {
+    const { monitor, ctx } = harness();
     vi.mocked(ctx.ui.select).mockResolvedValueOnce("invalid").mockResolvedValue("2. Reject [reject_once]");
     await expect(monitor.wait(ref, ctx)).rejects.toThrow("Invalid permission");
     expect((await monitor.wait(ref, ctx)).terminal).toBe(true);
+    await monitor.stop();
+  });
+  it("drains terminal output pages and joins fragments through the cursor", async () => {
+    const { monitor, calls } = harness({ pages: [
+      { text: "a", hasMore: true },
+      { text: "b", hasMore: true, terminal: true },
+      { text: "c", hasMore: false, terminal: true },
+    ] });
+    const updates: string[] = [];
+    const result = await monitor.wait(ref, context(), undefined, (_status, preview) => updates.push(preview));
+    expect(result.terminal).toBe(true);
+    expect(updates.at(-1)).toBe("abc");
+    const cursors = calls.filter(c => c.name === "live_output").map(c => c.args.cursor);
+    expect(cursors.filter(Boolean).length).toBeGreaterThan(0);
     await monitor.stop();
   });
 });

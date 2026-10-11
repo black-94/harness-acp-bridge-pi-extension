@@ -1,32 +1,106 @@
+/**
+ * Connection settings for the Pi bridge client.
+ *
+ * The client only *connects* to a harness-acp-bridge HTTP server, and may start a local one on
+ * demand (see `lifecycle.ts`). It never accepts a command or argv pass-through: only the server
+ * URL, timing, and a managed server entry/config belong here.
+ */
 import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+export const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
+export const DEFAULT_REQUEST_TIMEOUT_MS = 900_000;
+export const DEFAULT_INTERACTION_TIMEOUT_MS = 60_000;
+export const DEFAULT_POLL_INTERVAL_MS = 500;
+export const DEFAULT_STARTUP_TIMEOUT_MS = 30_000;
+export const DEFAULT_SERVER_MODULE = "@black942026/harness-acp-bridge-server";
 
 export interface BridgeSettings {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-  cwd: string;
-  pollIntervalMs: number;
+  baseUrl: string;
   requestTimeoutMs: number;
   interactionTimeoutMs: number;
+  pollIntervalMs: number;
+  /** Start a local server when the configured one is unreachable (loopback only). */
+  autoStart: boolean;
+  /** Explicit server module/path, or null to resolve the installed server dependency. */
+  serverEntry: string | null;
+  /** Explicit server YAML config path, or null to honor HARNESS_ACP_BRIDGE_CONFIG/defaults. */
+  configPath: string | null;
+  startupTimeoutMs: number;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function loadSettings(cwd: string, env = process.env): BridgeSettings {
-  const settings: BridgeSettings = {
-    command: process.execPath, args: [], env: {}, cwd,
-    pollIntervalMs: 500, requestTimeoutMs: 900_000, interactionTimeoutMs: 60_000,
-  };
-  let customCommand = false;
-  // Preserve runtime/socket resolution and SSH/Docker connectivity, not arbitrary secrets.
-  for (const key of ["XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "TMPDIR", "SSH_AUTH_SOCK", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"]) {
-    if (env[key] !== undefined) settings.env[key] = env[key]!;
+/** Validate an HTTP(S) base URL without a query, fragment, or embedded credentials. */
+export function normalizeBaseUrl(value: string, source: string): string {
+  let url: URL;
+  try { url = new URL(value); }
+  catch { throw new Error(`${source}: baseUrl is not a valid URL: ${JSON.stringify(value)}`); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${source}: baseUrl must use http or https`);
   }
+  if (url.username || url.password) throw new Error(`${source}: baseUrl must not embed credentials`);
+  if (url.search || url.hash) throw new Error(`${source}: baseUrl must not contain a query or fragment`);
+  return url.toString().replace(/\/$/, "");
+}
+
+/** True when the URL points at the local machine, so starting a local server is safe. */
+export function isLoopback(baseUrl: string): boolean {
+  const host = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return host === "localhost" || host === "::1" || host === "0.0.0.0" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+/**
+ * Import specifier for an explicit server entry, resolved against `cwd`.
+ *
+ * A `file:` URL is returned unchanged (never re-wrapped in `pathToFileURL`); an absolute or
+ * `./`/`../` path becomes a `file:` URL; a bare package name returns `null` (imported as-is).
+ * The entry must export `HarnessHttpServer`/`loadConfig` (the server package index), not a CLI.
+ */
+export function serverEntrySpecifier(entry: string, cwd: string): string | null {
+  if (entry.startsWith("file:")) return entry;
+  if (isAbsolute(entry)) return pathToFileURL(entry).href;
+  if (entry.startsWith("./") || entry.startsWith("../")) return pathToFileURL(resolve(cwd, entry)).href;
+  return null;
+}
+
+const TIMING_KEYS = { requestTimeoutMs: "requestTimeoutMs", interactionTimeoutMs: "interactionTimeoutMs", pollIntervalMs: "pollIntervalMs", startupTimeoutMs: "startupTimeoutMs" } as const;
+const SETTING_KEYS = ["baseUrl", "requestTimeoutMs", "interactionTimeoutMs", "pollIntervalMs", "autoStart", "serverEntry", "configPath", "startupTimeoutMs"] as const;
+
+function positiveInteger(value: unknown, source: string, name: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 2_147_483_647) {
+    throw new Error(`${source}: invalid ${name}`);
+  }
+  return value as number;
+}
+
+function booleanValue(value: unknown, source: string): boolean {
+  if (typeof value === "boolean") return value;
+  if (value === "0" || value === "false") return false;
+  if (value === "1" || value === "true") return true;
+  throw new Error(`${source}: invalid autoStart`);
+}
+
+/**
+ * Resolve settings from an explicit `PI_ACP_BRIDGE_SETTINGS` file, otherwise the global agent
+ * directory then the project `.pi` directory (project overrides global). Unknown fields are
+ * rejected instead of ignored.
+ */
+export function loadSettings(cwd: string, env: NodeJS.ProcessEnv = process.env): BridgeSettings {
+  const settings: BridgeSettings = {
+    baseUrl: DEFAULT_BASE_URL,
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    interactionTimeoutMs: DEFAULT_INTERACTION_TIMEOUT_MS,
+    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+    autoStart: true,
+    serverEntry: null,
+    configPath: null,
+    startupTimeoutMs: DEFAULT_STARTUP_TIMEOUT_MS,
+  };
   const agentDir = env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
   const paths = env.PI_ACP_BRIDGE_SETTINGS
     ? [resolve(cwd, env.PI_ACP_BRIDGE_SETTINGS)]
@@ -43,37 +117,25 @@ export function loadSettings(cwd: string, env = process.env): BridgeSettings {
     catch { throw new Error(`${path}: invalid JSON (check the bridge settings file)`); }
     if (!isRecord(data)) throw new Error(`${path}: expected an object`);
     for (const [key, value] of Object.entries(data)) {
-      if (key === "command" || key === "cwd") {
-        if (typeof value !== "string" || !value.trim()) throw new Error(`${path}: invalid ${key}`);
-        settings[key] = key === "cwd" && !isAbsolute(value) ? resolve(cwd, value) : value;
-        if (key === "command") customCommand = true;
-      } else if (key === "args") {
-        if (!Array.isArray(value) || !value.every(v => typeof v === "string")) throw new Error(`${path}: args must be strings`);
-        settings.args = value;
-      } else if (key === "env") {
-        if (!isRecord(value) || !Object.values(value).every(v => typeof v === "string")) throw new Error(`${path}: env must contain strings`);
-        settings.env = { ...settings.env, ...value as Record<string, string> };
-      } else if (key === "pollIntervalMs" || key === "requestTimeoutMs" || key === "interactionTimeoutMs") {
-        if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 2_147_483_647) throw new Error(`${path}: invalid ${key}`);
-        settings[key] = value as number;
-      } else throw new Error(`${path}: unknown setting ${key}`);
+      if (!(SETTING_KEYS as readonly string[]).includes(key)) throw new Error(`${path}: unknown setting ${key}`);
+      if (key === "baseUrl") {
+        if (typeof value !== "string" || !value.trim()) throw new Error(`${path}: invalid baseUrl`);
+        settings.baseUrl = normalizeBaseUrl(value.trim(), path);
+      } else if (key === "autoStart") {
+        settings.autoStart = booleanValue(value, path);
+      } else if (key === "serverEntry") {
+        if (value !== null && typeof value !== "string") throw new Error(`${path}: invalid serverEntry`);
+        settings.serverEntry = (value as string | null) || null;
+      } else if (key === "configPath") {
+        if (value !== null && typeof value !== "string") throw new Error(`${path}: invalid configPath`);
+        settings.configPath = (value as string | null) || null;
+      } else {
+        settings[TIMING_KEYS[key as keyof typeof TIMING_KEYS]] = positiveInteger(value, path, key);
+      }
     }
   }
-  if (env.HARNESS_ACP_BRIDGE_SERVER) {
-    settings.command = process.execPath;
-    settings.args = [resolve(cwd, env.HARNESS_ACP_BRIDGE_SERVER)];
-  } else if (!customCommand) {
-    // Resolve from this extension, not the user's cwd or PATH: dependency bins
-    // are not necessarily on PATH when Pi loads an installed npm package.
-    let cli: string;
-    try { cli = createRequire(import.meta.url).resolve("@black942026/harness-acp-bridge-server/dist/cli.js"); }
-    catch {
-      throw new Error("ACP bridge server dependency entry is unavailable: @black942026/harness-acp-bridge-server/dist/cli.js. Reinstall the extension or configure HARNESS_ACP_BRIDGE_SERVER with an existing built CLI path.");
-    }
-    settings.args = [cli, ...settings.args];
-  }
-  if (env.HARNESS_ACP_BRIDGE_CONFIG) {
-    settings.env.HARNESS_ACP_BRIDGE_CONFIG = resolve(cwd, env.HARNESS_ACP_BRIDGE_CONFIG);
-  }
+  // The server's own config env var stays honored unless the extension sets one explicitly.
+  if (settings.configPath) settings.configPath = resolve(cwd, settings.configPath);
+  else if (env.HARNESS_ACP_BRIDGE_CONFIG) settings.configPath = resolve(cwd, env.HARNESS_ACP_BRIDGE_CONFIG);
   return settings;
 }

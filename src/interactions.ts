@@ -1,28 +1,34 @@
+/**
+ * Reverse-request handling: turn a server `question` into an `answer_question` payload.
+ *
+ * A permission request maps a selected offered option back to its `optionId`; an
+ * information/elicitation request collects a typed object and validates it against the
+ * requested JSON Schema. When no interactive UI is available, the router returns `undefined`
+ * so the caller can surface `waiting_input` without inventing an answer. A user decision is
+ * never inferred from free text or defaults.
+ */
 import type { ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Ajv } from "ajv";
 import addFormats from "ajv-formats";
 import { isRecord } from "./config.ts";
 
-export interface Interaction {
+export type QuestionKind = "permission" | "information" | "elicitation";
+
+export interface Question {
   request_id: string;
-  permission: boolean;
+  kind: QuestionKind;
   title: string;
   message: string;
   options: Record<string, unknown>[];
   schema: Record<string, unknown> | null;
-  defaults: Record<string, unknown> | null;
-  raw_input: Record<string, unknown>;
+  raw?: Record<string, unknown>;
 }
-export type Decision = { answer: "accept"; response: Record<string, unknown> }
+
+export type Decision =
+  | { answer: "accept"; option_id: string }
+  | { answer: "accept"; content: Record<string, unknown> }
   | { answer: "reject" | "timeout" | "cancel" };
-interface Question {
-  id: string;
-  title: string;
-  prompt?: string;
-  kind: "single" | "input";
-  options?: { label: string; preview?: string }[];
-  default?: string;
-}
+
 interface Field {
   key: string;
   schema: Record<string, unknown>;
@@ -30,13 +36,33 @@ interface Field {
   choices?: unknown[];
   labels?: string[];
 }
+interface AskQuestion {
+  id: string;
+  title: string;
+  prompt?: string;
+  kind: "single" | "input";
+  options?: { label: string; preview?: string }[];
+  default?: string;
+}
+
 const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: true });
 (addFormats as unknown as (validator: Ajv) => void)(ajv);
 
-const shorten = (value: string, max: number) => value.length > max ? value.slice(0, max - 1) + "…" : value;
+const shorten = (value: string, max: number): string => (value.length > max ? value.slice(0, max - 1) + "…" : value);
 
-function fieldsFor(interaction: Interaction): { fields: Field[]; wholeObject: boolean } {
-  const schema = interaction.schema ?? { type: "object" };
+/** Tool input for display context, taken from the harness's original request frame. */
+function rawInput(question: Question): Record<string, unknown> | null {
+  const params = isRecord(question.raw) && isRecord(question.raw.params) ? question.raw.params : null;
+  const toolCall = params && isRecord(params.toolCall) ? params.toolCall : null;
+  return toolCall && isRecord(toolCall.rawInput) ? toolCall.rawInput : null;
+}
+function defaults(question: Question): Record<string, unknown> | null {
+  const params = isRecord(question.raw) && isRecord(question.raw.params) ? question.raw.params : null;
+  return params && isRecord(params.defaults) ? params.defaults : null;
+}
+
+function fieldsFor(question: Question): { fields: Field[]; wholeObject: boolean } {
+  const schema = question.schema ?? { type: "object" };
   const properties = schema.properties;
   const complex = ["oneOf", "anyOf", "allOf", "$ref", "if"].some(key => key in schema);
   if (complex || !isRecord(properties) || Object.keys(properties).length === 0) {
@@ -62,10 +88,10 @@ function parseField(value: string, field: Field): unknown {
   return JSON.parse(value);
 }
 
-function validate(interaction: Interaction, response: unknown): Record<string, unknown> {
+function validate(question: Question, response: unknown): Record<string, unknown> {
   if (!isRecord(response)) throw new Error("ACP response must be a JSON object");
-  if (interaction.schema) {
-    const check = ajv.compile(interaction.schema);
+  if (question.schema) {
+    const check = ajv.compile(question.schema);
     if (!check(response)) throw new Error(`Invalid ACP answer: ${ajv.errorsText(check.errors)}`);
   }
   return response;
@@ -91,38 +117,40 @@ export class InteractionRouter {
 
   constructor(private readonly timeoutMs: number) {}
 
-  resolve(interaction: Interaction, ctx: ExtensionContext, signal: AbortSignal, toolCtx?: ExtensionToolContext): Promise<Decision | undefined> {
+  resolve(question: Question, ctx: ExtensionContext, signal: AbortSignal, toolCtx?: ExtensionToolContext): Promise<Decision | undefined> {
     const result = this.tail.catch(() => {}).then(async () => {
       signal.throwIfAborted();
-      return this.prompt(interaction, ctx, signal, toolCtx);
+      return this.prompt(question, ctx, signal, toolCtx);
     });
     this.tail = result;
     return result;
   }
 
-  private async prompt(interaction: Interaction, ctx: ExtensionContext, signal: AbortSignal, toolCtx?: ExtensionToolContext): Promise<Decision | undefined> {
-    const context = [interaction.message, Object.keys(interaction.raw_input ?? {}).length ? JSON.stringify(interaction.raw_input, null, 2) : ""].filter(Boolean).join("\n");
-    const plan = fieldsFor(interaction);
-    const permissionOptions = (interaction.options ?? []).filter(o => typeof o.optionId === "string");
+  private async prompt(question: Question, ctx: ExtensionContext, signal: AbortSignal, toolCtx?: ExtensionToolContext): Promise<Decision | undefined> {
+    const input = rawInput(question);
+    const context = [question.message, input ? JSON.stringify(input, null, 2) : ""].filter(Boolean).join("\n");
+    const plan = fieldsFor(question);
+    const permission = question.kind === "permission";
+    const permissionOptions = (question.options ?? []).filter(o => typeof o.optionId === "string");
     const labels = permissionOptions.map((o, i) => shorten(`${i + 1}. ${String(o.name ?? o.optionId)} [${String(o.kind ?? o.optionId)}]`, 80));
     const fields = plan.fields;
-    const questions: Question[] = interaction.permission ? [{
-      id: "permission", title: shorten(interaction.title || "ACP permission", 200), kind: "single",
+    const questions: AskQuestion[] = permission ? [{
+      id: "permission", title: shorten(question.title || "ACP permission", 200), kind: "single",
       options: labels.map(label => ({ label, preview: context })),
     }] : fields.map((field, i) => ({
       id: `field_${i}`, title: shorten(String(field.schema.title ?? field.key), 200),
       prompt: shorten([context, field.schema.description, `Type: ${String(field.schema.type ?? "string")}${field.required ? " (required)" : " (optional; empty to omit)"}`].filter(Boolean).join("\n"), 500),
       kind: field.choices ? "single" : "input",
       options: field.labels?.map(label => ({ label })),
-      // Defaults are hints, never silently submitted. Optional omissions are explicit.
       ...(!field.required && !field.choices ? { default: "" } : {}),
     }));
+
     const ask = toolCtx?.tools?.find(tool => tool.name === "ask_user");
     const fitsAsk = context.length <= 4000 && questions.length <= 5
       && questions.every(q => !q.options || (q.options.length > 0 && q.options.length <= 5));
     if (ask && fitsAsk && typeof toolCtx?.executeTool === "function") {
       const outcome = await toolCtx.executeTool("ask_user", {
-        header: shorten(interaction.title || "ACP request", 200), questions,
+        header: shorten(question.title || "ACP request", 200), questions,
         timeoutPerQuestionMs: this.timeoutMs,
       }, { signal });
       signal.throwIfAborted();
@@ -138,11 +166,11 @@ export class InteractionRouter {
       } else if (data.status === "answered" && Array.isArray(data.answers)) {
         const answers = data.answers.filter(isRecord);
         const get = (index: number) => answers.find(a => a.id === questions[index].id) ?? answers[index];
-        if (interaction.permission) {
+        if (permission) {
           const selected = get(0)?.selections;
           const index = Array.isArray(selected) && selected.length === 1 ? labels.indexOf(String(selected[0])) : -1;
           if (index < 0) throw new Error("No offered permission option was explicitly selected");
-          return { answer: "accept", response: { option_id: permissionOptions[index].optionId } };
+          return { answer: "accept", option_id: String(permissionOptions[index].optionId) };
         }
         const response: Record<string, unknown> = {};
         for (let i = 0; i < fields.length; i++) {
@@ -163,11 +191,12 @@ export class InteractionRouter {
             response[field.key] = plan.wholeObject ? JSON.parse(answer.freeText) : parseField(answer.freeText, field);
           }
         }
-        return { answer: "accept", response: validate(interaction, plan.wholeObject ? response.response : response) };
+        return { answer: "accept", content: validate(question, plan.wholeObject ? response.response : response) };
       } else throw new Error("Unrecognized ask_user result");
     }
     if (!ctx.hasUI) return undefined; // Leave waiting_input available for a manual answer.
-    if (interaction.permission && labels.length === 0) throw new Error("Permission request offers no valid options");
+    if (permission && labels.length === 0) throw new Error("Permission request offers no valid options");
+    const knownDefaults = defaults(question);
     const response: Record<string, unknown> = {};
     const native = async (title: string, options?: string[], placeholder?: string): Promise<string | Decision> => {
       signal.throwIfAborted();
@@ -178,17 +207,17 @@ export class InteractionRouter {
       signal.throwIfAborted();
       return value === undefined ? { answer: Date.now() >= deadline ? "timeout" : "cancel" } : value;
     };
-    if (interaction.permission) {
-      const value = await native(`${interaction.title}\n${context}`, labels);
+    if (permission) {
+      const value = await native(`${question.title}\n${context}`, labels);
       if (typeof value !== "string") return value;
       const index = labels.indexOf(value);
       if (index < 0) throw new Error("Invalid permission selection");
-      return { answer: "accept", response: { option_id: permissionOptions[index].optionId } };
+      return { answer: "accept", option_id: String(permissionOptions[index].optionId) };
     }
     for (const field of fields) {
-      const hint = interaction.defaults?.[field.key] ?? field.schema.default;
+      const hint = knownDefaults?.[field.key] ?? field.schema.default;
       const value = await native(
-        `${interaction.title}\n${context}\n${String(field.schema.title ?? field.key)}: ${String(field.schema.description ?? "")} (${String(field.schema.type ?? "JSON")}${field.required ? ", required" : ", optional: empty to omit"})`,
+        `${question.title}\n${context}\n${String(field.schema.title ?? field.key)}: ${String(field.schema.description ?? "")} (${String(field.schema.type ?? "JSON")}${field.required ? ", required" : ", optional: empty to omit"})`,
         field.labels, hint === undefined ? undefined : String(typeof hint === "string" ? hint : JSON.stringify(hint)),
       );
       if (typeof value !== "string") return value;
@@ -200,6 +229,6 @@ export class InteractionRouter {
         response[field.key] = plan.wholeObject ? JSON.parse(value) : parseField(value, field);
       }
     }
-    return { answer: "accept", response: validate(interaction, plan.wholeObject ? response.response : response) };
+    return { answer: "accept", content: validate(question, plan.wholeObject ? response.response : response) };
   }
 }

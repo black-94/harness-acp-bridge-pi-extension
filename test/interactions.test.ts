@@ -2,14 +2,13 @@ import { describe, it, expect, vi } from "vitest";
 import { InteractionRouter } from "../src/interactions.ts";
 import { context, askContext, permission, information } from "./helpers.ts";
 
-const signal = () => new AbortController().signal;
-const router = () => new InteractionRouter(100);
+const signal = (): AbortSignal => new AbortController().signal;
+const router = (): InteractionRouter => new InteractionRouter(100);
 
 describe("ACP reverse interactions", () => {
   it("prefers ask_user and maps labels back to permission option ids", async () => {
     const ctx = askContext({ status: "answered", answers: [{ id: "permission", selections: ["2. Reject [reject_once]"] }] });
-    expect(await router().resolve(permission(), ctx, signal(), ctx))
-      .toEqual({ answer: "accept", response: { option_id: "deny" } });
+    expect(await router().resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "deny" });
     expect(ctx.executeTool).toHaveBeenCalledWith("ask_user", expect.objectContaining({ timeoutPerQuestionMs: 100 }), { signal: expect.any(AbortSignal) });
     expect(ctx.ui.select).not.toHaveBeenCalled();
   });
@@ -27,19 +26,19 @@ describe("ACP reverse interactions", () => {
     vi.mocked(ctx.executeTool).mockResolvedValue({
       result: { content: [{ type: "text", text: "User said allow" }], details: undefined }, isError: false,
       toolCall: { type: "toolCall", id: "nested", name: "ask_user", arguments: {} },
-    });
+    } as never);
     await expect(router().resolve(permission(), ctx, signal(), ctx)).rejects.toThrow("structured answer");
   });
   it("falls back to native select when ask_user is not callable", async () => {
     const ctx = context();
     vi.mocked(ctx.ui.select).mockResolvedValue("1. Allow [allow_once]");
-    expect(await router().resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", response: { option_id: "allow" } });
+    expect(await router().resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "allow" });
     expect(ctx.ui.select).toHaveBeenCalledWith(expect.stringContaining('"command": "ls"'), expect.any(Array), expect.objectContaining({ timeout: 100 }));
   });
   it("falls back only when ask_user could not enter its UI", async () => {
     const ctx = askContext({ status: "error", error: { code: "unsupported_mode" } });
     vi.mocked(ctx.ui.select).mockResolvedValue("2. Reject [reject_once]");
-    expect(await router().resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", response: { option_id: "deny" } });
+    expect(await router().resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "deny" });
   });
   it("does not bypass an invalid ask_user configuration", async () => {
     const ctx = askContext({ status: "error", error: { code: "invalid_config", message: "bad config" } });
@@ -65,7 +64,7 @@ describe("ACP reverse interactions", () => {
     const ctx = askContext({ status: "answered" });
     const options = Array.from({ length: 6 }, (_, i) => ({ optionId: String(i), name: "Allow", kind: "allow_once" }));
     vi.mocked(ctx.ui.select).mockResolvedValue("6. Allow [allow_once]");
-    expect(await router().resolve(permission({ options }), ctx, signal(), ctx)).toEqual({ answer: "accept", response: { option_id: "5" } });
+    expect(await router().resolve(permission({ options }), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "5" });
     expect(ctx.executeTool).not.toHaveBeenCalled();
   });
   it("collects and validates typed information fields via ask_user", async () => {
@@ -78,7 +77,7 @@ describe("ACP reverse interactions", () => {
       name: { type: "string" }, ready: { type: "boolean" }, count: { type: "integer" },
     }, required: ["name", "ready", "count"] });
     expect(await router().resolve(request, ctx, signal(), ctx))
-      .toEqual({ answer: "accept", response: { name: "hello", ready: false, count: 3 } });
+      .toEqual({ answer: "accept", content: { name: "hello", ready: false, count: 3 } });
   });
   it("collects typed fields through native input and select", async () => {
     const ctx = context();
@@ -87,13 +86,13 @@ describe("ACP reverse interactions", () => {
     const request = information({ type: "object", properties: {
       count: { type: "integer", minimum: 1 }, note: { type: "string" }, color: { type: "string", enum: ["red", "blue"] },
     }, required: ["count", "color"] });
-    expect(await router().resolve(request, ctx, signal())).toEqual({ answer: "accept", response: { count: 7, color: "blue" } });
+    expect(await router().resolve(request, ctx, signal())).toEqual({ answer: "accept", content: { count: 7, color: "blue" } });
   });
   it("accepts an explicit JSON object for complex or unspecified forms", async () => {
     const ctx = context();
     vi.mocked(ctx.ui.input).mockResolvedValue('{"nested":{"a":true}}');
     expect(await router().resolve(information({ type: "object" }), ctx, signal()))
-      .toEqual({ answer: "accept", response: { nested: { a: true } } });
+      .toEqual({ answer: "accept", content: { nested: { a: true } } });
   });
   it("rejects invalid schema values rather than silently coercing them", async () => {
     const ctx = context();

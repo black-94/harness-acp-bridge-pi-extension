@@ -1,120 +1,84 @@
-import { readFileSync } from "node:fs";
-import type { Readable } from "node:stream";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+/**
+ * HTTP client for the harness-acp-bridge server.
+ *
+ * The client owns no scheduling, ACP protocol, launch logic, or persistence: it is a thin
+ * transport over `POST /api/<name>`. Success is `{ ok: true, data }`; failure is
+ * `{ ok: false, error: { code, message, detail } }`. Success is never guessed.
+ */
 import { isRecord, type BridgeSettings } from "./config.ts";
-import { MAX_STARTUP_STDERR_CHARS, startupFailure, validateLaunch } from "./startup.ts";
 
-const { name, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { name: string; version: string };
+export class BridgeError extends Error {
+  override name = "BridgeError";
+  constructor(public readonly code: string, message: string, public readonly detail?: unknown) {
+    super(message);
+  }
+}
+
+export function errorInfo(error: unknown): { code: string; message: string; detail?: unknown } {
+  if (error instanceof BridgeError) {
+    return { code: error.code, message: error.message, ...(error.detail !== undefined ? { detail: error.detail } : {}) };
+  }
+  return { code: "internal_error", message: error instanceof Error ? error.message : String(error) };
+}
 
 export interface BridgeConnection {
   call(name: string, args?: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>>;
 }
 
-export class BridgeError extends Error {
-  constructor(public readonly code: string, message: string, public readonly payload?: unknown) {
-    super(message);
-    this.name = "BridgeError";
-  }
-}
+export class BridgeHttpClient implements BridgeConnection {
+  private readonly baseUrl: string;
+  private readonly timeoutMs: number;
 
-/** No daemon, ACP transport, launch logic or scheduling is implemented here. */
-export class BridgeClient implements BridgeConnection {
-  private client?: Client;
-  private transport?: StdioClientTransport;
-  private connecting?: Promise<Tool[]>;
-  private tools?: Tool[];
-  private closed = false;
-
-  constructor(private readonly settings: BridgeSettings) {}
-
-  connect(): Promise<Tool[]> {
-    if (this.closed) return Promise.reject(new Error("Bridge client is closed"));
-    if (this.tools) return Promise.resolve(this.tools);
-    if (this.connecting) return this.connecting;
-    this.connecting = this.open().finally(() => { this.connecting = undefined; });
-    return this.connecting;
-  }
-
-  private async open(): Promise<Tool[]> {
-    const env = { ...getDefaultEnvironment(), ...this.settings.env };
-    try { validateLaunch(this.settings, env); }
-    catch (error) { throw new BridgeError("invalid_launch", startupFailure(this.settings, error)); }
-    const client = new Client({ name, version });
-    const transport = new StdioClientTransport({
-      command: this.settings.command, args: this.settings.args, cwd: this.settings.cwd,
-      env, stderr: "pipe",
-    });
-    // Keep a bounded startup prefix, then redact the combined text on exposure
-    // (keys/values may span chunks). After discovery only drain, never retain.
-    let stderr = "";
-    let collecting = true;
-    const stderrStream = transport.stderr as Readable | null;
-    stderrStream?.setEncoding("utf8");
-    stderrStream?.on("data", (chunk: string) => {
-      if (collecting) stderr += chunk.slice(0, MAX_STARTUP_STDERR_CHARS - stderr.length);
-    });
-    this.client = client;
-    this.transport = transport;
-    client.onclose = () => {
-      if (this.client === client) {
-        this.client = undefined;
-        this.transport = undefined;
-        this.tools = undefined;
-      }
-    };
-    try {
-      await client.connect(transport, { timeout: this.settings.requestTimeoutMs });
-      const tools: Tool[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await client.listTools(cursor ? { cursor } : undefined, { timeout: this.settings.requestTimeoutMs });
-        tools.push(...page.tools);
-        cursor = page.nextCursor;
-      } while (cursor);
-      if (this.closed) throw new Error("Bridge client closed during initialization");
-      this.tools = tools;
-      return tools;
-    } catch (error) {
-      await client.close().catch(() => {});
-      await transport.close().catch(() => {});
-      if (this.client === client) { this.client = undefined; this.transport = undefined; }
-      throw new BridgeError("startup_failed", startupFailure(this.settings, error, stderr));
-    } finally {
-      collecting = false;
-      stderr = "";
-    }
+  constructor(settings: BridgeSettings) {
+    this.baseUrl = settings.baseUrl.replace(/\/$/, "");
+    this.timeoutMs = settings.requestTimeoutMs;
   }
 
   async call(name: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    signal?.throwIfAborted();
-    await this.connect();
-    signal?.throwIfAborted();
-    // Never automatically retry mutating calls: the server may already have accepted them.
-    const result = await this.client!.callTool(
-      { name, arguments: args }, undefined,
-      { signal, timeout: this.settings.requestTimeoutMs },
-    );
-    let data: unknown = result.structuredContent;
-    if (!isRecord(data)) {
-      const text = Array.isArray(result.content)
-        ? result.content.filter(c => c.type === "text").map(c => c.text).join("\n") : "";
-      try { data = JSON.parse(text); }
-      catch { throw new BridgeError("invalid_result", `Non-JSON response from ${name}`); }
-    }
-    if (!isRecord(data)) throw new BridgeError("invalid_result", `Expected object from ${name}`);
-    if (result.isError) {
-      throw new BridgeError(String(data.code ?? "server_error"), String(data.message ?? "Bridge tool failed"), data);
-    }
-    return data;
-  }
+    const timedOut = { value: false };
+    const timeoutController = new AbortController();
+    const timer = setTimeout(() => { timedOut.value = true; timeoutController.abort(); }, this.timeoutMs);
+    timer.unref?.();
+    const composite = signal ? AbortSignal.any([timeoutController.signal, signal]) : timeoutController.signal;
 
-  async close(): Promise<void> {
-    this.closed = true;
-    this.tools = undefined;
-    await this.client?.close().catch(() => {});
-    await this.transport?.close().catch(() => {});
-    await this.connecting?.catch(() => {});
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/api/${name}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(args ?? {}),
+        signal: composite,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw new BridgeError("request_aborted", "the HTTP request was cancelled");
+      if (timedOut.value) throw new BridgeError("request_timeout", `${name} did not answer within ${this.timeoutMs}ms`);
+      throw new BridgeError("network_error", `could not reach harness-acp-bridge at ${this.baseUrl}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    let text: string;
+    try { text = await response.text(); }
+    catch (error) {
+      if (signal?.aborted) throw new BridgeError("request_aborted", "the HTTP response was cancelled");
+      throw new BridgeError("invalid_response", `${name} response could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let body: unknown;
+    try { body = JSON.parse(text); }
+    catch { throw new BridgeError("invalid_response", `${name} returned a non-JSON response (HTTP ${response.status})`); }
+    if (!isRecord(body)) throw new BridgeError("invalid_response", `${name} returned a non-object envelope (HTTP ${response.status})`);
+
+    if (body.ok === true) {
+      if (!isRecord(body.data)) throw new BridgeError("invalid_response", `${name} succeeded without an object "data"`);
+      return body.data;
+    }
+    if (body.ok === false && isRecord(body.error)) {
+      const error = body.error;
+      const code = typeof error.code === "string" && error.code ? error.code : "server_error";
+      const message = typeof error.message === "string" && error.message ? error.message : `${name} failed`;
+      throw new BridgeError(code, message, error.detail);
+    }
+    throw new BridgeError("invalid_response", `${name} returned an unrecognized envelope (HTTP ${response.status})`);
   }
 }

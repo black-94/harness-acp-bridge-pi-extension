@@ -1,8 +1,16 @@
+/**
+ * Authoritative message monitoring for one `session_id`/`message_id`.
+ *
+ * `message_status` is the source of truth for state, terminality, and pending questions;
+ * `live_output` only feeds the rolling preview. Polling is serialized per watch, and the cursor
+ * returned by `live_output` is passed back unchanged so no output is lost — including the
+ * `has_more` pages that arrive with `terminal: true`.
+ */
 import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import type { BridgeConnection } from "./client.ts";
 import { isRecord } from "./config.ts";
-import { InteractionRouter, type Interaction } from "./interactions.ts";
+import { InteractionRouter, type Question } from "./interactions.ts";
 
 export interface MessageRef { session_id: string; message_id: string }
 interface Waiter {
@@ -19,14 +27,16 @@ interface Watch {
   result?: Record<string, unknown>;
   error?: unknown;
   preview: string;
-  offset?: number;
-  lastStatus?: Record<string, unknown>;
+  cursor?: string;
   prompt?: { id: string; controller: AbortController; done: Promise<void> };
   answered: Set<string>;
   unhandled: Set<string>;
 }
 
-/** Polling is authoritative. MCP completion log messages are advisory only. */
+const PREVIEW_LIMIT = 16_384;
+const PREVIEW_PAGE_EVENTS = 100;
+const MAX_DRAIN_PAGES = 1000;
+
 export class MessageMonitor {
   private watches = new Map<string, Watch>();
   private stopped = false;
@@ -66,7 +76,7 @@ export class MessageMonitor {
 
   async wait(ref: MessageRef, ctx: ExtensionToolContext, signal?: AbortSignal, update?: Waiter["update"]): Promise<Record<string, unknown>> {
     if (signal?.aborted) {
-      await this.client.call("cancel_message", { ...ref });
+      await this.client.call("cancel_message", { ...ref }).catch(() => {});
       signal.throwIfAborted();
     }
     const watch = this.start(ref);
@@ -78,7 +88,7 @@ export class MessageMonitor {
       waiter = { ctx, update, resolve, reject };
       watch.waiters.add(waiter);
     });
-    const abort = () => {
+    const abort = (): void => {
       watch.prompt?.controller.abort();
       waiter.reject(signal?.reason ?? new Error("ACP wait aborted"));
     };
@@ -104,35 +114,58 @@ export class MessageMonitor {
     }
   }
 
+  private currentQuestion(status: Record<string, unknown>): Question | undefined {
+    const questions = Array.isArray(status.questions) ? status.questions : [];
+    return questions.filter(isRecord).find(q => typeof q.request_id === "string") as Question | undefined;
+  }
+
+  /** Drain every currently available output page, joining fragments; the cursor advances. */
+  private async pump(watch: Watch, signal: AbortSignal): Promise<void> {
+    for (let page = 0; page < MAX_DRAIN_PAGES; page++) {
+      const output = await this.client.call("live_output", {
+        ...watch.ref, limit: PREVIEW_PAGE_EVENTS, ...(watch.cursor ? { cursor: watch.cursor } : {}),
+      }, signal);
+      if (typeof output.next_cursor === "string") watch.cursor = output.next_cursor;
+      if (Array.isArray(output.events)) {
+        for (const event of output.events) {
+          if (isRecord(event) && typeof event.text === "string") watch.preview = (watch.preview + event.text).slice(-PREVIEW_LIMIT);
+        }
+      }
+      if (output.has_more !== true) return;
+    }
+  }
+
   private async loop(watch: Watch): Promise<void> {
     const { ref } = watch;
     const signal = watch.controller.signal;
     while (!signal.aborted) {
-      const status = await this.client.call("message_result", { ...ref }, signal);
-      watch.lastStatus = status;
+      const status = await this.client.call("message_status", { ...ref }, signal);
       this.ctx.ui.setStatus(`acp:${this.key(ref)}`, `ACP ${ref.message_id}: ${String(status.state)}`);
-      const interaction = isRecord(status.interaction) ? status.interaction : undefined;
-      if (watch.prompt && (status.terminal === true || interaction?.request_id !== watch.prompt.id)) {
+      const question = this.currentQuestion(status);
+      if (watch.prompt && (status.terminal === true || question?.request_id !== watch.prompt.id)) {
         watch.prompt.controller.abort();
         await watch.prompt.done;
         watch.prompt = undefined;
       }
       if (status.terminal === true) {
+        // Drain remaining output even when has_more arrives alongside terminal: true, and let the
+        // UI render the final preview before the terminal status settles.
+        await this.pump(watch, signal).catch(() => {});
         watch.result = status;
         this.onSettled(ref);
+        for (const waiter of watch.waiters) waiter.update?.(status, watch.preview);
         for (const waiter of watch.waiters) waiter.resolve(status);
         if (watch.waiters.size === 0 && this.ctx.hasUI) {
-          this.ctx.ui.notify(`ACP ${ref.message_id}: ${String(status.state)}. Read with acp_message_result.`, status.state === "failed" ? "warning" : "info");
+          this.ctx.ui.notify(`ACP ${ref.message_id}: ${String(status.state)}. Read with acp_message_status.`, status.state === "failed" ? "warning" : "info");
         }
         return;
       }
-      if (interaction && typeof interaction.request_id === "string" && !watch.prompt
-        && !watch.answered.has(interaction.request_id) && !watch.unhandled.has(interaction.request_id)) {
-        const id = interaction.request_id;
+      if (question && !watch.prompt && !watch.answered.has(question.request_id) && !watch.unhandled.has(question.request_id)) {
+        const id = question.request_id;
         const controller = new AbortController();
         const done = (async () => {
           const active = watch.waiters.values().next().value as Waiter | undefined;
-          const decision = await this.router.resolve(interaction as unknown as Interaction, this.ctx, controller.signal, active?.ctx);
+          const decision = await this.router.resolve(question, this.ctx, controller.signal, active?.ctx);
           if (controller.signal.aborted || signal.aborted) return;
           if (!decision) {
             watch.unhandled.add(id);
@@ -141,8 +174,9 @@ export class MessageMonitor {
             return;
           }
           // Revalidate against the server immediately before answering a possibly stale UI.
-          const current = await this.client.call("message_result", { ...ref }, signal);
-          if (current.terminal === true || !isRecord(current.interaction) || current.interaction.request_id !== id) return;
+          const current = await this.client.call("message_status", { ...ref }, signal);
+          const still = this.currentQuestion(current);
+          if (current.terminal === true || !still || still.request_id !== id) return;
           await this.client.call("answer_question", { ...ref, request_id: id, ...decision }, signal);
           watch.answered.add(id);
         })().catch(error => {
@@ -155,11 +189,7 @@ export class MessageMonitor {
         void done.finally(() => { if (watch.prompt?.controller === controller) watch.prompt = undefined; });
       }
       if (watch.waiters.size > 0) {
-        const output = await this.client.call("live_output", {
-          ...ref, ...(watch.offset === undefined ? {} : { offset: watch.offset }), max_bytes: 16_384,
-        }, signal);
-        if (typeof output.next_offset === "number") watch.offset = output.next_offset;
-        if (typeof output.chunk === "string") watch.preview = (watch.preview + output.chunk).slice(-16_384);
+        await this.pump(watch, signal);
         for (const waiter of watch.waiters) waiter.update?.(status, watch.preview);
       }
       await delay(this.pollIntervalMs, undefined, { signal });
