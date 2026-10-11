@@ -11,14 +11,15 @@ import { context } from "./helpers.ts";
 
 const SENTINEL = "PREVIEW-SENTINEL-DO-NOT-ENTER-CONTEXT";
 
-interface StubState { answered: boolean; sessions: Array<Record<string, unknown>> }
+interface StubState { answered: boolean; sessions: Array<Record<string, unknown>>; requests: string[] }
 function stubServer() {
-  const state: StubState = { answered: false, sessions: [] };
+  const state: StubState = { answered: false, sessions: [], requests: [] };
   const server: Server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", chunk => chunks.push(chunk));
     request.on("end", () => {
       const method = (request.url ?? "").replace(/^\/api\//, "");
+      state.requests.push(method);
       const params = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
       const question = { request_id: "req-1", kind: "permission", title: "Run bash", message: "Allow command?", options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Reject", kind: "reject_once" }], schema: null };
       if (method === "message_status") {
@@ -195,6 +196,28 @@ describe("Pi tools over the HTTP bridge", () => {
         expect(joined).toContain("needs input");
         expect(joined).not.toContain("stalled");
         for (const line of render(waiting, width)) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+    } finally { await host.cleanup(); }
+  });
+
+  it.each(["acp_wait", "acp_send_message"])("uses the correct abort policy for %s", async name => {
+    const host = await setup(true);
+    try {
+      vi.mocked(host.ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {
+        options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+      }));
+      const controller = new AbortController();
+      const args = name === "acp_wait" ? { session_id: "s1", message_id: "m1" } : { session_id: "s1", text: "hello" };
+      const promise = host.execute(name, args, controller.signal);
+      await vi.waitFor(() => expect(host.ctx.ui.select).toHaveBeenCalled());
+      controller.abort();
+      await expect(promise).rejects.toThrow();
+      expect(host.state.requests.filter(method => method === "cancel_message")).toHaveLength(name === "acp_wait" ? 0 : 1);
+      expect(host.state.requests).not.toContain("answer_question");
+      if (name === "acp_wait") {
+        host.state.answered = true;
+        expect((await host.execute("acp_wait", { session_id: "s1", message_id: "m1" })).details!.terminal).toBe(true);
+        expect(host.state.requests.filter(method => method === "send_message")).toHaveLength(0);
       }
     } finally { await host.cleanup(); }
   });

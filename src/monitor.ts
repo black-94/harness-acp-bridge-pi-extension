@@ -13,6 +13,7 @@ import { isRecord } from "./config.ts";
 import { InteractionRouter, type Question } from "./interactions.ts";
 
 export interface MessageRef { session_id: string; message_id: string }
+export interface WaitOptions { cancelOnAbort?: boolean }
 interface Waiter {
   ctx: ExtensionToolContext;
   // Returns `unknown`, not `void`: the host `onUpdate` sink may return a promise, and the caller
@@ -98,9 +99,11 @@ export class MessageMonitor {
     return watch;
   }
 
-  async wait(ref: MessageRef, ctx: ExtensionToolContext, signal?: AbortSignal, update?: Waiter["update"]): Promise<Record<string, unknown>> {
+  async wait(ref: MessageRef, ctx: ExtensionToolContext, signal?: AbortSignal, update?: Waiter["update"], options: WaitOptions = {}): Promise<Record<string, unknown>> {
+    // send_message keeps its original cancellation policy; acp_wait only detaches locally.
+    const cancelOnAbort = options.cancelOnAbort ?? true;
     if (signal?.aborted) {
-      await this.client.call("cancel_message", { ...ref }).catch(() => {});
+      if (cancelOnAbort) await this.client.call("cancel_message", { ...ref }).catch(() => {});
       signal.throwIfAborted();
     }
     const watch = this.start(ref);
@@ -113,15 +116,15 @@ export class MessageMonitor {
       watch.waiters.add(waiter);
     });
     const abort = (): void => {
-      watch.prompt?.controller.abort();
+      if (cancelOnAbort || watch.waiters.size === 1) watch.prompt?.controller.abort();
       waiter.reject(signal?.reason ?? new Error("ACP wait aborted"));
     };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
     try { return await result; }
     catch (error) {
-      if (signal?.aborted && !this.stopped) {
-        // Tool cancellation cancels the remote message, not just the local polling call.
+      if (cancelOnAbort && signal?.aborted && !this.stopped) {
+        // Only send_message retains the original remote cancellation on tool abort.
         await this.client.call("cancel_message", { ...ref }).catch(cancelError => {
           guard(() => this.ctx.ui.notify(`ACP cancellation failed; message may still be running: ${String(cancelError)}`, "warning"));
         });

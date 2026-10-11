@@ -125,12 +125,13 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
     toolCtx: ExtensionToolContext,
     signal: AbortSignal | undefined,
     onUpdate: ((result: AgentToolResult<Record<string, unknown>>) => void) | undefined,
+    cancelOnAbort = true,
   ) => {
     const result = await monitor!.wait(ref, toolCtx, signal, (status, preview) => {
       // Return the host callback's value (possibly a promise) so the monitor's presentation guard
       // can attach to a rejection; otherwise an async-rejecting onUpdate becomes unhandled.
       return onUpdate?.(previewUpdate(status, preview));
-    });
+    }, { cancelOnAbort });
     return { ...toolResult({ ...result, ...ref }, secrets), ...(result.state === "failed" ? { isError: true } : {}) };
   };
 
@@ -166,12 +167,12 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "acp_wait", label: "ACP Wait", description:
-      "Wait for a previously submitted ACP bridge message by session_id/message_id. Handles reverse requests using ask_user or native dialogs and streams UI-only preview updates. Aborting cancels the remote message. Without interactive UI it returns waiting_input without inventing an answer; use acp_answer_question then acp_wait again.",
+      "Wait for a previously submitted ACP bridge message by session_id/message_id. Handles reverse requests using ask_user or native dialogs and streams UI-only preview updates. Aborting only stops local waiting and leaves the remote message running; another acp_wait can resume it. Without interactive UI it returns waiting_input without inventing an answer; use acp_answer_question then acp_wait again.",
     parameters: WAIT_SCHEMA, outputSchema: OUTPUT_SCHEMA,
     renderResult: renderAcpResult,
     async execute(_id, ref, signal, onUpdate, toolCtx) {
       await ensureServer();
-      return wait(ref as MessageRef, toolCtx, signal, onUpdate);
+      return wait(ref as MessageRef, toolCtx, signal, onUpdate, false);
     },
   });
 

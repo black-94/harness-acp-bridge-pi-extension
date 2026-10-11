@@ -84,6 +84,29 @@ describe("message monitoring", () => {
     expect(calls.some(c => c.name === "cancel_message")).toBe(true);
     await monitor.stop();
   });
+  it("detaches wait-only abort without cancelling or answering, then resumes", async () => {
+    const { monitor, calls, ctx } = harness();
+    const controller = new AbortController();
+    vi.mocked(ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {
+      options?.signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+    }));
+    const promise = monitor.wait(ref, ctx, controller.signal, undefined, { cancelOnAbort: false });
+    await vi.waitFor(() => expect(ctx.ui.select).toHaveBeenCalled());
+    controller.abort();
+    await expect(promise).rejects.toThrow();
+    expect(calls.some(c => c.name === "cancel_message" || c.name === "answer_question")).toBe(false);
+    vi.mocked(ctx.ui.select).mockResolvedValue("1. Allow [allow_once]");
+    expect((await monitor.wait(ref, ctx, undefined, undefined, { cancelOnAbort: false })).terminal).toBe(true);
+    await monitor.stop();
+  });
+  it.each([false, true])("handles an already-aborted signal with cancelOnAbort=%s", async cancelOnAbort => {
+    const { monitor, calls, ctx } = harness();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(monitor.wait(ref, ctx, controller.signal, undefined, { cancelOnAbort })).rejects.toThrow();
+    expect(calls).toEqual(cancelOnAbort ? [{ name: "cancel_message", args: ref }] : []);
+    await monitor.stop();
+  });
   it("dismisses a stale UI when the remote turn becomes terminal", async () => {
     const { monitor, calls, ctx, finish } = harness();
     vi.mocked(ctx.ui.select).mockImplementation((_title, _options, options) => new Promise(resolve => {

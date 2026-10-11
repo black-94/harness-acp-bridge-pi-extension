@@ -121,7 +121,9 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 - print/JSON 等无 UI 模式遇到反向请求时返回 `waiting_input` 及原始 `questions`，不批准也不伪造。
   调用 `acp_answer_question` 后再 `acp_wait`。
 - 关闭弹窗 → `answer: cancel`；到期 → `answer: timeout`；服务端决定继续还是取消消息。
-- 中止 Pi 的等待工具（工具取消 / `signal`）→ 调用 `cancel_message` 取消当前远端消息。
+- 中止 `acp_wait`（工具取消 / `signal`）仅退出本地等待，不取消远端消息；可用同一
+  `session_id`/`message_id` 再次 `acp_wait`。中止 `acp_send_message` 仍调用 `cancel_message`
+  取消远端消息。服务端超时、问答结果、JSONL 错误的原有处理不变。
 - **预览与活动仅用于 UI**：等待期间通过工具更新的 `content: [{ type: "text", text: "" }]`、
   `structuredContent: {}`、`details.preview` 传递预览与服务器活动指标（`details.activity`：
   `observed_phase`、`seconds_since_progress`、`stalled` 等），由 `acp_send_message`/`acp_wait` 的自定义
