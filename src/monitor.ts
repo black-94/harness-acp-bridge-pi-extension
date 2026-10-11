@@ -1,10 +1,10 @@
 /**
  * Authoritative message monitoring for one `session_id`/`message_id`.
  *
- * `message_status` is the source of truth for state, terminality, and pending questions;
- * `live_output` only feeds the rolling preview. Polling is serialized per watch, and the cursor
- * returned by `live_output` is passed back unchanged so no output is lost — including the
- * `has_more` pages that arrive with `terminal: true`.
+ * `message_status` is the ONLY source of truth for state, terminality, pending questions, the
+ * optional bounded `progress` snapshot, and the terminal `result`. There is no separate output
+ * endpoint: the UI-only preview is derived from the current `status.progress` snapshot each poll
+ * (replaced, never appended), and the terminal `result` drives the final update.
  */
 import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -30,15 +30,12 @@ interface Watch {
   result?: Record<string, unknown>;
   error?: unknown;
   preview: string;
-  cursor?: string;
   prompt?: { id: string; controller: AbortController; done: Promise<void> };
   answered: Set<string>;
   unhandled: Set<string>;
 }
 
 const PREVIEW_LIMIT = 16_384;
-const PREVIEW_PAGE_EVENTS = 100;
-const MAX_DRAIN_PAGES = 1000;
 
 /**
  * Run a progress or UI side effect so it can never affect message monitoring.
@@ -58,6 +55,41 @@ function guard(effect: () => unknown): void {
       (result as Promise<unknown>).then(undefined, () => {});
     }
   } catch { /* presentation-only: never break monitoring or the remote task */ }
+}
+
+/**
+ * Derive the UI-only preview from the server's bounded `status.progress` snapshot.
+ *
+ * `progress` is `{ text, reasoning, tool_calls }`. The preview is REPLACED each poll (never
+ * appended), so a repeated snapshot cannot duplicate lines, and it is truncated to a bounded
+ * length. This text is presentation only and never enters `content`/`structuredContent`.
+ */
+function progressPreview(status: Record<string, unknown>): string {
+  const progress = isRecord(status.progress) ? status.progress : null;
+  if (!progress) return "";
+  const parts: string[] = [];
+  const text = typeof progress.text === "string" ? progress.text : "";
+  const reasoning = typeof progress.reasoning === "string" ? progress.reasoning : "";
+  if (text) parts.push(text);
+  else if (reasoning) parts.push(reasoning);
+  if (Array.isArray(progress.tool_calls)) {
+    const calls = progress.tool_calls.filter(isRecord).map(call => {
+      const name = typeof call.name === "string" ? call.name
+        : typeof call.title === "string" ? call.title : "tool";
+      const state = typeof call.state === "string" ? ` (${call.state})` : "";
+      return `${name}${state}`;
+    });
+    if (calls.length) parts.push(calls.join("\n"));
+  }
+  const joined = parts.join("\n");
+  return joined.length > PREVIEW_LIMIT ? joined.slice(-PREVIEW_LIMIT) : joined;
+}
+
+/** Terminal preview: the final result text, so the last update is the settled answer. */
+function resultPreview(status: Record<string, unknown>): string {
+  const result = isRecord(status.result) ? status.result : null;
+  const text = result && typeof result.text === "string" ? result.text : "";
+  return text.length > PREVIEW_LIMIT ? text.slice(-PREVIEW_LIMIT) : text;
 }
 
 export class MessageMonitor {
@@ -146,22 +178,6 @@ export class MessageMonitor {
     return questions.filter(isRecord).find(q => typeof q.request_id === "string") as Question | undefined;
   }
 
-  /** Drain every currently available output page, joining fragments; the cursor advances. */
-  private async pump(watch: Watch, signal: AbortSignal): Promise<void> {
-    for (let page = 0; page < MAX_DRAIN_PAGES; page++) {
-      const output = await this.client.call("live_output", {
-        ...watch.ref, limit: PREVIEW_PAGE_EVENTS, ...(watch.cursor ? { cursor: watch.cursor } : {}),
-      }, signal);
-      if (typeof output.next_cursor === "string") watch.cursor = output.next_cursor;
-      if (Array.isArray(output.events)) {
-        for (const event of output.events) {
-          if (isRecord(event) && typeof event.text === "string") watch.preview = (watch.preview + event.text).slice(-PREVIEW_LIMIT);
-        }
-      }
-      if (output.has_more !== true) return;
-    }
-  }
-
   private async loop(watch: Watch): Promise<void> {
     const { ref } = watch;
     const signal = watch.controller.signal;
@@ -175,9 +191,8 @@ export class MessageMonitor {
         watch.prompt = undefined;
       }
       if (status.terminal === true) {
-        // Drain remaining output even when has_more arrives alongside terminal: true, and let the
-        // UI render the final preview before the terminal status settles.
-        await this.pump(watch, signal).catch(() => {});
+        // The terminal `result` drives the final UI update, so the last preview is the settled answer.
+        watch.preview = resultPreview(status);
         watch.result = status;
         // `onSettled` persists watch bookkeeping (`pi.appendEntry`), not presentation: a genuine
         // failure must surface through the watch error path rather than be swallowed by `guard`.
@@ -221,7 +236,8 @@ export class MessageMonitor {
         void done.finally(() => { if (watch.prompt?.controller === controller) watch.prompt = undefined; });
       }
       if (watch.waiters.size > 0) {
-        await this.pump(watch, signal);
+        // The UI-only preview is the current bounded progress snapshot, replaced (never appended).
+        watch.preview = progressPreview(status);
         // A progress renderer is presentation: isolate each waiter so one bad update cannot stop
         // polling a still-running remote message or fail a sibling waiter.
         for (const waiter of watch.waiters) guard(() => waiter.update?.(status, watch.preview));

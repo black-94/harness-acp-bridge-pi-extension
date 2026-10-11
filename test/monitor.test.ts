@@ -7,20 +7,21 @@ import type { BridgeConnection } from "../src/client.ts";
 const ref = { session_id: "s1", message_id: "m1" };
 const PREVIEW = "PREVIEW-SENTINEL";
 
-function harness(options: { ui?: boolean; pages?: Array<{ text: string; hasMore: boolean; terminal?: boolean }> } = {}) {
+function harness(options: { ui?: boolean; progress?: boolean } = {}) {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   const state: { terminal: boolean; question: unknown | null; statusCalls: number } = { terminal: false, question: permission(), statusCalls: 0 };
-  const queue = options.pages ? [...options.pages] : null;
   const connection: BridgeConnection = {
     async call(name, args = {}) {
       calls.push({ name, args });
       if (name === "message_status") {
         state.statusCalls++;
-        return { state: state.terminal ? "completed" : "waiting_input", terminal: state.terminal, questions: state.terminal || !state.question ? [] : [state.question], ...(state.terminal ? { text: "done", result: { text: "done" } } : {}) };
-      }
-      if (name === "live_output") {
-        if (queue) { const page = queue.shift(); return page ? { events: [{ type: "answer", text: page.text }], next_cursor: `c${calls.length}`, has_more: page.hasMore, terminal: page.terminal ?? false } : { events: [], next_cursor: "end", has_more: false }; }
-        return { events: [{ type: "answer", text: PREVIEW }], next_cursor: "p1", has_more: false };
+        return {
+          state: state.terminal ? "completed" : state.question ? "waiting_input" : "running",
+          terminal: state.terminal,
+          questions: state.terminal || !state.question ? [] : [state.question],
+          // The UI-only preview is derived from this bounded snapshot (no separate output endpoint).
+          ...(state.terminal ? { text: "done", result: { text: "done" } } : options.progress === false ? {} : { progress: { text: PREVIEW } }),
+        };
       }
       if (name === "answer_question") { state.question = null; state.terminal = true; return { answered: true }; }
       if (name === "cancel_message") { state.terminal = true; return { state: "cancelled", terminal: true }; }
@@ -139,18 +140,19 @@ describe("message monitoring", () => {
     expect((await monitor.wait(ref, ctx)).terminal).toBe(true);
     await monitor.stop();
   });
-  it("drains terminal output pages and joins fragments through the cursor", async () => {
-    const { monitor, calls } = harness({ pages: [
-      { text: "a", hasMore: true },
-      { text: "b", hasMore: true, terminal: true },
-      { text: "c", hasMore: false, terminal: true },
-    ] });
+  it("never calls live_output and derives a bounded preview from the status progress snapshot", async () => {
+    const { monitor, calls } = harness();
     const updates: string[] = [];
     const result = await monitor.wait(ref, context(), undefined, (_status, preview) => updates.push(preview));
     expect(result.terminal).toBe(true);
-    expect(updates.at(-1)).toBe("abc");
-    const cursors = calls.filter(c => c.name === "live_output").map(c => c.args.cursor);
-    expect(cursors.filter(Boolean).length).toBeGreaterThan(0);
+    // No separate output endpoint is ever polled.
+    expect(calls.some(call => call.name === "live_output")).toBe(false);
+    expect(calls.every(call => call.name === "message_status" || call.name === "answer_question")).toBe(true);
+    // The preview comes from the current progress snapshot and is REPLACED, never appended.
+    expect(updates.some(preview => preview.includes(PREVIEW))).toBe(true);
+    expect(updates.every(preview => !preview.includes(PREVIEW + PREVIEW))).toBe(true);
+    // The terminal result drives the final update.
+    expect(updates.at(-1)).toBe("done");
     await monitor.stop();
   });
 });

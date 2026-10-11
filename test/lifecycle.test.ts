@@ -1,17 +1,13 @@
 import { createServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { createServer as createHttp, type Server } from "node:http";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ServerLifecycle, redact } from "../src/lifecycle.ts";
 import type { BridgeSettings } from "../src/config.ts";
-
-const here = dirname(fileURLToPath(import.meta.url));
-const serverDir = process.env.ACP_BRIDGE_SERVER_DIR ? resolve(process.env.ACP_BRIDGE_SERVER_DIR) : resolve(here, "../../server");
-const fakeHarness = join(serverDir, "test/fixtures/fake-acp-harness.mjs");
+import { fakeHarness, newContractServerEntry, serverSpawningAvailable } from "./server-build.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
@@ -25,7 +21,7 @@ async function freePort(): Promise<number> {
 }
 
 function settings(baseUrl: string, overrides: Partial<BridgeSettings> = {}): BridgeSettings {
-  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 15000, ...overrides };
+  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: newContractServerEntry(), configPath: null, startupTimeoutMs: 15000, ...overrides };
 }
 
 function registry(dir: string): Record<string, { pid: number | null }> {
@@ -41,8 +37,8 @@ describe("diagnostics redaction", () => {
   });
 });
 
-describe.runIf(existsSync(fakeHarness))("managed local server lifecycle", () => {
-  it("starts a loopback server on demand and reuses it", async () => {
+describe("managed local server lifecycle", () => {
+  it.runIf(serverSpawningAvailable())("starts a loopback server on demand and reuses it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-acp-life-"));
     const clientDir = join(dir, "client");
     const port = await freePort();
@@ -85,5 +81,24 @@ describe.runIf(existsSync(fakeHarness))("managed local server lifecycle", () => 
     expect(await lifecycle.probe()).toBe("incompatible");
     await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
     expect(registry(clientDir)).toEqual({});
+  });
+
+  it("rejects an older-protocol daemon without restarting or killing it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-acp-life-"));
+    const port = await freePort();
+    // A still-running protocol-2 daemon must be rejected, never replaced.
+    const listener: Server = createHttp((_request, response) => { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ ok: true, data: { status: "ok", protocol_version: 2, pid: process.pid } })); });
+    await new Promise<void>(r => listener.listen(port, "127.0.0.1", () => r()));
+    cleanups.push(() => new Promise<void>(r => listener.close(() => r())));
+    const clientDir = join(dir, "client");
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
+    expect(await lifecycle.probe()).toBe("incompatible");
+    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
+    // Nothing was started or recorded...
+    expect(registry(clientDir)).toEqual({});
+    // ...and the old daemon is still serving (it was not torn down).
+    const response = await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect((await response.json() as { ok: boolean }).ok).toBe(true);
   });
 });

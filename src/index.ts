@@ -2,7 +2,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { BridgeError, BridgeHttpClient } from "./client.ts";
+import { authenticateSession } from "./auth.ts";
+import { BridgeError, BridgeHttpClient, errorInfo } from "./client.ts";
 import { isRecord, loadSettings } from "./config.ts";
 import { InteractionRouter } from "./interactions.ts";
 import { ServerLifecycle } from "./lifecycle.ts";
@@ -12,6 +13,11 @@ import { renderAcpResult } from "./render.ts";
 import { OUTPUT_SCHEMA, TOOL_SPECS, WAIT_SCHEMA } from "./schemas.ts";
 
 const watchEntry = "harness-acp-bridge-watch";
+
+/** Structured, model-readable envelope for a failed bridge call. */
+function errorEnvelope(error: unknown): Record<string, unknown> {
+  return { ok: false, error: errorInfo(error) };
+}
 
 /** Final, model-facing result: the terminal message status only, never the UI preview. */
 function toolResult(data: Record<string, unknown>, secrets: readonly string[]): AgentToolResult<Record<string, unknown>> {
@@ -27,6 +33,40 @@ function toolResult(data: Record<string, unknown>, secrets: readonly string[]): 
   }
   const structuredContent = JSON.parse(full) as NonNullable<AgentToolResult<Record<string, unknown>>["structuredContent"]>;
   return { content: [{ type: "text" as const, text }], details: data, structuredContent };
+}
+
+/**
+ * A unified authentication failure, kept model-readable.
+ *
+ * The server returns `authentication_required` with detail
+ * `{ session_id, next_action: { method: "authenticate", params: { session_id } } }`. Throwing an
+ * `Error` would collapse that to its message, losing the `session_id` the model needs (especially
+ * after `create_session`). Returning an `isError` result instead preserves the full structured
+ * envelope for both the model-facing text and `structuredContent`, and never auto-authenticates.
+ */
+function authRequiredResult(error: unknown): AgentToolResult<Record<string, unknown>> {
+  const envelope = errorEnvelope(error);
+  const full = JSON.stringify(envelope, null, 2);
+  return {
+    isError: true,
+    content: [{ type: "text" as const, text: full }],
+    details: envelope,
+    structuredContent: envelope as NonNullable<AgentToolResult<Record<string, unknown>>["structuredContent"]>,
+  };
+}
+
+function isAuthRequired(error: unknown): boolean {
+  return error instanceof BridgeError && error.code === "authentication_required";
+}
+
+/**
+ * A terminal status is reported to the model as a tool error when the turn failed OR carries an
+ * `error` object (e.g. `cancelled`/`input_timeout`, or an `authentication_rate_limited` flow). A
+ * plain user cancel with no error is a normal terminal result. The full status — including
+ * `state` and `error` — is always preserved in `content`/`details`/`structuredContent`.
+ */
+function isErrorStatus(status: Record<string, unknown>): boolean {
+  return status.terminal === true && (status.state === "failed" || isRecord(status.error));
 }
 
 /**
@@ -85,6 +125,8 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
   let client: BridgeHttpClient | undefined;
   let lifecycle: ServerLifecycle | undefined;
   let monitor: MessageMonitor | undefined;
+  let router: InteractionRouter | undefined;
+  let pollIntervalMs = 500;
   let ctx: ExtensionContext | undefined;
   let initializing: Promise<void> | undefined;
   let ensured: Promise<void> | undefined;
@@ -107,7 +149,9 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
         const settings = loadSettings(ctx!.cwd);
         client = new BridgeHttpClient(settings);
         lifecycle = new ServerLifecycle(settings, process.env, ctx!.cwd);
-        monitor = new MessageMonitor(client, new InteractionRouter(settings.interactionTimeoutMs), ctx!, settings.pollIntervalMs, ref => remember(ref, false));
+        router = new InteractionRouter(settings.interactionTimeoutMs);
+        pollIntervalMs = settings.pollIntervalMs;
+        monitor = new MessageMonitor(client, router, ctx!, settings.pollIntervalMs, ref => remember(ref, false));
       }
     })().finally(() => { initializing = undefined; });
     return initializing;
@@ -132,7 +176,7 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
       // can attach to a rejection; otherwise an async-rejecting onUpdate becomes unhandled.
       return onUpdate?.(previewUpdate(status, preview));
     }, { cancelOnAbort });
-    return { ...toolResult({ ...result, ...ref }, secrets), ...(result.state === "failed" ? { isError: true } : {}) };
+    return { ...toolResult({ ...result, ...ref }, secrets), ...(isErrorStatus(result) ? { isError: true } : {}) };
   };
 
   for (const tool of TOOL_SPECS) {
@@ -144,7 +188,13 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
         async execute(_id, args, signal, onUpdate, toolCtx) {
           await ensureServer();
           const params = args as Record<string, unknown>;
-          const data = await client!.call("send_message", params, signal);
+          let data: Record<string, unknown>;
+          try {
+            data = await client!.call("send_message", params, signal);
+          } catch (error) {
+            if (isAuthRequired(error)) return authRequiredResult(error);
+            throw error;
+          }
           if (typeof params.session_id !== "string" || typeof data.message_id !== "string") {
             throw new BridgeError("invalid_result", "send_message returned no valid message reference");
           }
@@ -155,19 +205,44 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
       });
       continue;
     }
+    if (tool.name === "authenticate") {
+      // The tool itself drives the interactive authentication workflow: it asks every
+      // server-provided question through the router (never choosing a method or a token for the
+      // user), sends each answer as a session-scoped answer_question, and polls to a terminal
+      // state. Aborting only detaches the local wait.
+      pi.registerTool({
+        name, label: tool.label, description: tool.description, parameters: tool.parameters, outputSchema: OUTPUT_SCHEMA,
+        async execute(_id, args, signal, _onUpdate, toolCtx) {
+          await ensureServer();
+          const params = args as Record<string, unknown>;
+          if (typeof params.session_id !== "string") throw new BridgeError("invalid_param", "session_id is required");
+          const status = await authenticateSession(
+            client!, router!, { session_id: params.session_id }, ctx!, toolCtx,
+            signal ?? new AbortController().signal, pollIntervalMs,
+          );
+          return { ...toolResult(status, secrets), ...(isErrorStatus(status) ? { isError: true } : {}) };
+        },
+      });
+      continue;
+    }
     pi.registerTool({
       name, label: tool.label, description: tool.description, parameters: tool.parameters, outputSchema: OUTPUT_SCHEMA,
       async execute(_id, args, signal) {
         await ensureServer();
-        const data = await client!.call(tool.name, args as Record<string, unknown>, signal);
-        return toolResult(data, secrets);
+        try {
+          const data = await client!.call(tool.name, args as Record<string, unknown>, signal);
+          return toolResult(data, secrets);
+        } catch (error) {
+          if (isAuthRequired(error)) return authRequiredResult(error);
+          throw error;
+        }
       },
     });
   }
 
   pi.registerTool({
     name: "acp_wait", label: "ACP Wait", description:
-      "Wait for a previously submitted ACP bridge message by session_id/message_id. Handles reverse requests using ask_user or native dialogs and streams UI-only preview updates. Aborting only stops local waiting and leaves the remote message running; another acp_wait can resume it. Without interactive UI it returns waiting_input without inventing an answer; use acp_answer_question then acp_wait again.",
+      "Wait for a previously submitted ACP bridge message by session_id/message_id. Handles reverse requests using ask_user or native dialogs and renders status.progress as a UI-only preview. Aborting only stops local waiting and leaves the remote message running; another acp_wait can resume it. Without interactive UI it returns waiting_input without inventing an answer; use acp_answer_question then acp_wait again.",
     parameters: WAIT_SCHEMA, outputSchema: OUTPUT_SCHEMA,
     renderResult: renderAcpResult,
     async execute(_id, ref, signal, onUpdate, toolCtx) {

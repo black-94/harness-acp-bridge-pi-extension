@@ -77,12 +77,12 @@ function stubServer(mode: "interactive" | "running" = "interactive") {
           const done = ++state.polls >= 3;
           response.end(JSON.stringify({ ok: true, data: done
             ? { session_id: "s1", message_id: MESSAGE_ID, state: "completed", terminal: true, questions: [], result: { text: "final:hello" }, activity: { ...ACTIVITY, stalled: false } }
-            : { session_id: "s1", message_id: MESSAGE_ID, state: "running", terminal: false, questions: [], activity: ACTIVITY } }));
+            : { session_id: "s1", message_id: MESSAGE_ID, state: "running", terminal: false, questions: [], progress: { text: SENTINEL }, activity: ACTIVITY } }));
           return;
         }
         response.end(JSON.stringify(state.answered
           ? { ok: true, data: { session_id: "s1", message_id: MESSAGE_ID, state: "completed", terminal: true, questions: [], result: { text: "final:hello" }, activity: { ...ACTIVITY, stalled: false } } }
-          : { ok: true, data: { session_id: "s1", message_id: MESSAGE_ID, state: "waiting_input", terminal: false, questions: [question], activity: ACTIVITY } }));
+          : { ok: true, data: { session_id: "s1", message_id: MESSAGE_ID, state: "waiting_input", terminal: false, questions: [question], progress: { text: SENTINEL }, activity: ACTIVITY } }));
         return;
       }
       if (method === "answer_question") {
@@ -93,9 +93,8 @@ function stubServer(mode: "interactive" | "running" = "interactive") {
       }
       if (method === "send_message") state.sendCalls++;
       const bodies: Record<string, unknown> = {
-        ping: { ok: true, data: { status: "ok", protocol_version: 2, sessions: 0 } },
+        ping: { ok: true, data: { status: "ok", protocol_version: 3, sessions: 0 } },
         send_message: { ok: true, data: { message_id: MESSAGE_ID } },
-        live_output: { ok: true, data: { session_id: "s1", events: [{ type: "answer", text: SENTINEL, seq: 1, timestamp: "now", message_id: MESSAGE_ID, complete: true }], next_cursor: "c1", has_more: false, session_closed: false, terminal: false } },
         cancel_message: { ok: true, data: { state: "cancelled", terminal: true } },
         close_session: { ok: true, data: { session_id: params.session_id, state: "closed" } },
       };
@@ -236,9 +235,8 @@ function monitorHarness(options: { ui?: boolean; emptyOutput?: boolean } = {}) {
       if (name === "message_status") {
         return terminal
           ? { state: "completed", terminal: true, questions: [], result: { text: "done" } }
-          : { state: "running", terminal: false, questions: [] };
+          : { state: "running", terminal: false, questions: [], ...(options.emptyOutput ? {} : { progress: { text: SENTINEL } }) };
       }
-      if (name === "live_output") return { events: options.emptyOutput ? [] : [{ type: "answer", text: SENTINEL }], next_cursor: "c1", has_more: false };
       if (name === "cancel_message") { terminal = true; return { state: "cancelled", terminal: true }; }
       return {};
     },

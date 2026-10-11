@@ -99,6 +99,11 @@ describe("ACP reverse interactions", () => {
     vi.mocked(ctx.ui.input).mockResolvedValue("0");
     await expect(router().resolve(information({ type: "object", properties: { count: { type: "integer", minimum: 1 } } }), ctx, signal())).rejects.toThrow("Invalid ACP answer");
   });
+  it("enforces additionalProperties:false via ajv (not silently ignored)", async () => {
+    const ctx = context();
+    vi.mocked(ctx.ui.input).mockResolvedValue('{"extra":1}');
+    await expect(router().resolve(information({ type: "object", additionalProperties: false }), ctx, signal())).rejects.toThrow("Invalid ACP answer");
+  });
   it("validates formats and does not use a default without a user answer", async () => {
     const ctx = context();
     vi.mocked(ctx.ui.input).mockResolvedValue("invalid");
@@ -126,5 +131,54 @@ describe("ACP reverse interactions", () => {
     await first;
     await second;
     expect(ctx.ui.select).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a long auth URL fully in the option preview and caps the ask_user prompt at 500", async () => {
+    const url = `https://auth.example.com/login?state=${"a".repeat(600)}&scope=openid`;
+    const ctx = askContext({ status: "answered", answers: [{ id: "field_0", selections: ["1. true"] }] });
+    const question = information({ type: "object", properties: { opened: { type: "boolean", enum: [true] } }, required: ["opened"] });
+    question.message = `Open this URL and complete authentication, then confirm here: ${url}`;
+    // A boolean-enum confirm question is a single choice presented via ask_user.
+    expect(await router().resolve(question, ctx, signal(), ctx)).toEqual({ answer: "accept", content: { opened: true } });
+    const payload = vi.mocked(ctx.executeTool).mock.calls[0]![1] as { questions: Array<{ prompt?: string; options?: Array<{ preview?: string }> }> };
+    expect(payload.questions).toHaveLength(1);
+    // The real `ask_user` schema rejects prompt > 500, so a legal call must never exceed it.
+    expect(payload.questions[0]!.prompt!.length).toBeLessThanOrEqual(500);
+    // The full URL survives intact in the option preview (preview limit is 4000).
+    const preview = payload.questions[0]!.options![0]!.preview!;
+    expect(preview).toContain(url);
+    expect(preview.length).toBeLessThanOrEqual(4000);
+  });
+
+  it("never sends an input field whose full prompt exceeds ask_user's 500-char limit", async () => {
+    const ctx = context(); // no `ask_user` callable
+    const long = `Read this context before answering: ${"x".repeat(600)}`;
+    const question = information({ type: "object", properties: { note: { type: "string" } }, required: ["note"] });
+    question.message = long;
+    vi.mocked(ctx.ui.input).mockResolvedValue("typed");
+    // Native UI is the fallback (no prompt length limit), so the answer is still collected.
+    expect(await router().resolve(question, ctx, signal())).toEqual({ answer: "accept", content: { note: "typed" } });
+    const title = vi.mocked(ctx.ui.input).mock.calls[0]![0] as string;
+    expect(title).toContain(long);
+  });
+
+  it("leaves an over-long input question pending without UI instead of truncating it into ask_user", async () => {
+    const ctx = askContext({ status: "answered", answers: [] });
+    const question = information({ type: "object", properties: { note: { type: "string" } }, required: ["note"] });
+    question.message = `Context: ${"x".repeat(600)}`;
+    (ctx as { hasUI: boolean }).hasUI = false;
+    expect(await router().resolve(question, ctx, signal(), ctx)).toBeUndefined();
+    // It must not smuggle the >500 prompt into executeTool.
+    expect(ctx.executeTool).not.toHaveBeenCalled();
+  });
+
+  it("falls back to native UI (never truncating) when the message is too long for preview too", async () => {
+    const ctx = context();
+    const huge = `Context: ${"y".repeat(5000)}`;
+    const question = information({ type: "object", properties: { opened: { type: "boolean", enum: [true] } }, required: ["opened"] });
+    question.message = huge;
+    vi.mocked(ctx.ui.select).mockResolvedValue("1. true");
+    expect(await router().resolve(question, ctx, signal())).toEqual({ answer: "accept", content: { opened: true } });
+    expect(vi.mocked(ctx.ui.select).mock.calls[0]![0]).toContain(huge);
   });
 });

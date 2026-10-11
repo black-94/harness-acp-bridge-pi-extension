@@ -50,6 +50,19 @@ const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: true });
 
 const shorten = (value: string, max: number): string => (value.length > max ? value.slice(0, max - 1) + "…" : value);
 
+/**
+ * `ask_user` enforces `prompt <= 500` and `preview <= 4000` characters and rejects a payload that
+ * violates them. A server-provided message can be longer than 500 characters (e.g. a 700-character
+ * authentication URL), so:
+ *   - a single-choice field carries the FULL message as each option's `preview` (<=4000) and only
+ *     a truncated `prompt`; the usable URL is never lost;
+ *   - an input field has no option to carry the message, so it may only use `ask_user` when the
+ *     entire prompt still fits in 500 characters; otherwise the router falls back to the native UI
+ *     (no length limit) or, without UI, leaves the question pending as `waiting_input`.
+ */
+const ASK_PROMPT_LIMIT = 500;
+const ASK_PREVIEW_LIMIT = 4000;
+
 /** Tool input for display context, taken from the harness's original request frame. */
 function rawInput(question: Question): Record<string, unknown> | null {
   const params = isRecord(question.raw) && isRecord(question.raw.params) ? question.raw.params : null;
@@ -134,20 +147,36 @@ export class InteractionRouter {
     const permissionOptions = (question.options ?? []).filter(o => typeof o.optionId === "string");
     const labels = permissionOptions.map((o, i) => shorten(`${i + 1}. ${String(o.name ?? o.optionId)} [${String(o.kind ?? o.optionId)}]`, 80));
     const fields = plan.fields;
+    // The complete message is representable as an option `preview` only while it fits the limit;
+    // otherwise the whole message must stay in a (shorter) prompt, which is only possible for an
+    // input field small enough to fit — never by truncating the only usable URL.
+    const preview = context.length <= ASK_PREVIEW_LIMIT ? context : null;
+    type FieldPlan = { field: Field; index: number; fullPrompt: string; usesPreview: boolean };
+    const fieldPlans: FieldPlan[] = fields.map((field, index) => ({
+      field, index, usesPreview: Boolean(field.choices),
+      fullPrompt: [context, field.schema.description, `Type: ${String(field.schema.type ?? "string")}${field.required ? " (required)" : " (optional; empty to omit)"}`].filter(Boolean).join("\n"),
+    }));
     const questions: AskQuestion[] = permission ? [{
       id: "permission", title: shorten(question.title || "ACP permission", 200), kind: "single",
-      options: labels.map(label => ({ label, preview: context })),
-    }] : fields.map((field, i) => ({
-      id: `field_${i}`, title: shorten(String(field.schema.title ?? field.key), 200),
-      prompt: shorten([context, field.schema.description, `Type: ${String(field.schema.type ?? "string")}${field.required ? " (required)" : " (optional; empty to omit)"}`].filter(Boolean).join("\n"), 500),
+      options: labels.map(label => ({ label, ...(preview !== null ? { preview } : {}) })),
+    }] : fieldPlans.map(({ field, index, fullPrompt, usesPreview }) => ({
+      id: `field_${index}`, title: shorten(String(field.schema.title ?? field.key), 200),
+      // The prompt is capped at the `ask_user` limit; a choice field's full message lives in the
+      // option `preview`, and an input field is only asked through `ask_user` when it fully fits.
+      prompt: shorten(fullPrompt, ASK_PROMPT_LIMIT),
       kind: field.choices ? "single" : "input",
-      options: field.labels?.map(label => ({ label })),
+      options: field.choices ? field.labels?.map(label => ({ label, ...(preview !== null ? { preview } : {}) })) : undefined,
       ...(!field.required && !field.choices ? { default: "" } : {}),
     }));
 
     const ask = toolCtx?.tools?.find(tool => tool.name === "ask_user");
-    const fitsAsk = context.length <= 4000 && questions.length <= 5
+    const carrierOk = permission
+      ? preview !== null
+      : fieldPlans.every(plan => plan.usesPreview ? preview !== null : plan.fullPrompt.length <= ASK_PROMPT_LIMIT);
+    const promptOk = questions.every(q => q.prompt === undefined || q.prompt.length <= ASK_PROMPT_LIMIT);
+    const shapeOk = questions.length <= 5
       && questions.every(q => !q.options || (q.options.length > 0 && q.options.length <= 5));
+    const fitsAsk = carrierOk && promptOk && shapeOk;
     if (ask && fitsAsk && typeof toolCtx?.executeTool === "function") {
       const outcome = await toolCtx.executeTool("ask_user", {
         header: shorten(question.title || "ACP request", 200), questions,

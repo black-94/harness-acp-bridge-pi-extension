@@ -13,7 +13,7 @@ loopback 地址上没有兼容服务，扩展会按需启动已安装的 server 
 ```text
 Pi 工具调用（保持执行）
   ├─ POST send_message → message_id（服务端异步受理）
-  ├─ 轮询 message_status / live_output
+  ├─ 轮询 message_status（含可选的有界 progress 快照 → UI-only 预览）
   ├─ waiting_input → ask_user / 原生 select、input 弹窗 → answer_question → 继续原调用
   └─ completed / failed / cancelled → 返回终态 message_status（result 即最终答案）
 ```
@@ -70,7 +70,8 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 
 ## 本地服务生命周期
 
-1. `ping` 配置的 `baseUrl`；返回 `protocol_version: 2` 的服务被直接复用。
+1. `ping` 配置的 `baseUrl`；返回 `protocol_version: 3` 的服务被直接复用。旧协议（例如仍在运行的
+   `protocol_version: 2` daemon）一律视为不兼容并**拒绝**，但**绝不重启、替换或终止**它。
 2. 若地址被占据但**不是**兼容的 bridge 服务（错误信封、协议版本不符、或非 JSON 监听者），
    扩展报 `incompatible_server` 并且**不**另起服务——外来服务不会被当作“不存在”。
 3. 若无人监听、`autoStart` 为真，且地址是 **loopback**，扩展才启动服务。非 loopback 地址绝不
@@ -88,20 +89,43 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 
 ## 工具
 
-注册 12 个 `acp_` 工具（与服务端同名）加 `acp_wait`：`acp_ping`、`acp_search_harness`、
+注册 11 个 `acp_` 工具（与服务端同名）加 `acp_wait`：`acp_ping`、`acp_search_harness`、
 `acp_create_session`、`acp_close_session`、`acp_authenticate`、`acp_auth_status`、
 `acp_set_session_options`、`acp_send_message`、`acp_cancel_message`、`acp_message_status`、
-`acp_live_output`、`acp_answer_question`，外加上面的 `acp_wait`。
+`acp_answer_question`，外加上面的 `acp_wait`。
 
 - **`acp_send_message`**：提交后在同一调用内同步等待终态（与 `acp_wait` 相同语义）。
 - **`acp_wait`**：只等待已知的 `session_id`/`message_id`，不重复提交；用于 MCP/重载后恢复、无 UI
   场景回答后继续等待。
-- `acp_live_output` 使用 `cursor`/`limit`/`wait_ms`；把 `next_cursor` 原样回传，始终排空
-  `has_more`（即使 `terminal: true`），按 `seq`/`type` 拼接 `complete: false` 片段。
+- **`acp_authenticate`**：驱动服务端托管的认证流程（见下）；`acp_auth_status` 轮询同一流程状态，
+  无流程时退回认证探测语义。
+- 没有单独的增量输出接口（`live_output` 已移除）。运行中的预览只来自 `message_status` 的可选有界
+  `progress` 快照（`{text, reasoning, tool_calls}`），仅供 UI；终态以 `result` 为准。
 
 推荐顺序：`acp_create_session` → `acp_send_message`（内部同步等待并弹窗）→ 结束；不再使用时
-`acp_close_session`。服务端仍只接受每会话一个非终态消息，`busy` 等错误原样报告；客户端不排队、
-不 steer、不重试。网络中断后提交可能已生效，用同一 `idempotency_key` 重试可避免重复。
+`acp_close_session`。需要登录时 `create_session` 会返回结构化的 `authentication_required` 错误
+（`detail.session_id` + `detail.next_action`），由模型调用 `acp_authenticate`；扩展**不会**自动认证。
+服务端仍只接受每会话一个非终态消息，`busy` 等错误原样报告；客户端不排队、不 steer、不重试。网络中断后
+提交可能已生效，用同一 `idempotency_key` 重试可避免重复。
+
+## 认证
+
+`acp_authenticate` 只接收 `{session_id}`，由**工具自身**完成交互，绝不由调用方传入 `method_id`：
+
+1. 服务端立即返回流程快照 `{session_id, state, terminal, questions, candidates?, authenticated?, error?}`
+   （`state` ∈ `waiting_input|authenticating|ready|failed|cancelled`；限流为
+   `authentication_rate_limited` 且 `terminal:true`；已登录直接 `ready`）。
+2. 方法选择是一条 `information` 问题（`schema` 要求 `method_id` 枚举受支持 ID）。扩展把候选
+   （**包括** `type!=="agent"` 的不受支持项及其 `Not supported in harness_acp_bridge` 说明）完整展示给
+   用户，由用户选择；**绝不自动选择**，即使审批模式为 `auto`。
+3. 浏览器/设备码/令牌问题按服务端给出的 schema 原样收集：CodeBuddy 是“打开此 URL 后确认”
+   （`opened:boolean`），确认**不等于**成功——扩展继续轮询直到真实 `ready/loginCompleted`；Agy 令牌、
+   Codex 设备码等按 `string` 等 schema 连续多轮收集。扩展不打印、不持久化真实令牌。
+4. 每轮回答都以**会话级** `answer_question`（不带 `message_id`）提交，回答前再次校验 `request_id`；
+   弹窗期间并行轮询流程状态，流程终态或 `request_id` 变化会立即取消弹窗。
+5. 无 UI 时返回 `waiting_input` 及完整 `questions`，不虚构答案；用户 `answer_question` 后再
+   `acp_authenticate` 继续。中止 `acp_authenticate` **仅**退出本地等待，不取消远端消息，也不发答案；
+   用户取消/超时则作为真实答案提交。
 
 ## 反向交互
 
@@ -127,11 +151,14 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 - **预览与活动仅用于 UI**：等待期间通过工具更新的 `content: [{ type: "text", text: "" }]`、
   `structuredContent: {}`、`details.preview` 传递预览与服务器活动指标（`details.activity`：
   `observed_phase`、`seconds_since_progress`、`stalled` 等），由 `acp_send_message`/`acp_wait` 的自定义
-  `renderResult` 渲染（Pi 默认不展示 `details`；终态排空剩余分页后也会刷新一次 UI）。运行中表头
-  显示最后观测阶段与「距上次进展 X 秒 / 疑似停滞」；`running` 仅表示「仍在等待 ACP 结果」，
-  **不保证模型仍在推进**。预览与活动**不进入**模型上下文，也**不**出现在 `send_message`/`wait`
-  最终返回的 `content`、`structuredContent` 或可持久化数据里。最终答案来自 `message_status.result`；
-  需要增量输出时显式调用 `acp_live_output`。
+  `renderResult` 渲染（Pi 默认不展示 `details`）。预览**派生**自 `message_status.progress` 的有界快照
+  （每轮替换，不追加），终态以 `result` 刷新。运行中表头显示最后观测阶段与「距上次进展 X 秒 /
+  疑似停滞」；`running` 仅表示「仍在等待 ACP 结果」，**不保证模型仍在推进**。预览与活动**不进入**
+  模型上下文，也**不**出现在 `send_message`/`wait` 最终返回的 `content`、`structuredContent` 或可
+  持久化数据里。最终答案来自 `message_status.result`；没有单独的增量输出接口。
+- 需要登录时，`create_session`/`send_message` 返回结构化的 `authentication_required` 工具错误
+  （模型可读的 `content`/`structuredContent` 保留 `code`、`detail.session_id`、`detail.next_action`），
+  提示模型调用 `acp_authenticate`；扩展不会自动认证。
 - `failed` 终态作为工具错误返回。超过 20,000 字符的结果写入权限 0600 的临时 JSON 文件，工具文本
   附路径，结构化结果保留完整数据。
 - shutdown/reload 停止本地轮询、关闭弹窗，不隐式关闭服务端会话、不停止复用服务；分支内已保存的
@@ -175,10 +202,13 @@ npm audit --omit=dev
 npm pack --dry-run
 ```
 
-`npm run check` 会按需启动**真实的已安装 HTTP server**与 server 仓库的 mock ACP harness（不调用
-真实模型、不用 Docker/SSH），驱动提交 / 同步等待 / 结果 / 权限弹窗 / 输出分页 / 取消 / 无 UI /
-shutdown 不杀复用实例等链路。用 `ACP_BRIDGE_SERVER_DIR` 指向 server 检出以提供 mock harness
-fixture（默认 `../server`）。
+`npm run check` 会按需启动**真实 HTTP server**与 server 仓库的 mock ACP harness（不调用真实模型、不用
+Docker/SSH），驱动创建会话 / 提交 / 同步等待 / 结果 / 权限弹窗 / 认证流程（未登录 `create_session` →
+方法选择 → URL/令牌回答 → `auth_status` 成功）/ 取消 / 无 UI / shutdown 不杀复用实例等链路。集成与
+生命周期测试优先加载**仓库内 server 构建**（`../server/dist`，`serverEntry` 指向其模块入口），仅在
+父检出缺失时回退到已安装包；因为客户端要求 `protocol_version: 3`，这些用例在 server 以新契约重建前
+会**跳过**（不会对旧的已安装 server 假绿）。用 `ACP_BRIDGE_SERVER_DIR` 指向 server 检出（默认
+`../server`）。
 
 本扩展以 TypeScript 源码发布，由 Pi 加载，无需 `dist`。`pi-package` 用于扩展目录发现，
 `pi-extension` 标识扩展类型；Pi 提供的包仅声明为 peerDependencies。

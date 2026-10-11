@@ -11,9 +11,21 @@ import { context } from "./helpers.ts";
 
 const SENTINEL = "PREVIEW-SENTINEL-DO-NOT-ENTER-CONTEXT";
 
-interface StubState { answered: boolean; sessions: Array<Record<string, unknown>>; requests: string[] }
+interface StubState { answered: boolean; sessions: Array<Record<string, unknown>>; requests: string[]; methodChosen: boolean; urlConfirmed: boolean }
 function stubServer() {
-  const state: StubState = { answered: false, sessions: [], requests: [] };
+  const state: StubState = { answered: false, sessions: [], requests: [], methodChosen: false, urlConfirmed: false };
+  const AUTH_URL = `https://auth.example.com/login?state=${"a".repeat(600)}&scope=openid`;
+  const authQuestion = () => state.methodChosen
+    ? { request_id: "q-url", kind: "elicitation", title: "Complete authentication", message: `Open this URL and complete authentication, then confirm here: ${AUTH_URL}`, options: [], schema: { type: "object", properties: { opened: { type: "boolean", enum: [true] } }, required: ["opened"], additionalProperties: false } }
+    : { request_id: "q-method", kind: "information", title: "Choose an authentication method", message: "Choose one supported authentication method.", options: [], schema: { type: "object", properties: { method_id: { type: "string", enum: ["agent"] } }, required: ["method_id"], additionalProperties: false } };
+  const authSnapshot = () => ({
+    session_id: "s1",
+    state: state.methodChosen && state.urlConfirmed ? "ready" : "waiting_input",
+    terminal: state.methodChosen && state.urlConfirmed,
+    questions: state.methodChosen && state.urlConfirmed ? [] : [authQuestion()],
+    candidates: [{ id: "agent", name: "Agent", type: "agent", supported: true }, { id: "legacy", name: "Legacy", type: "browser", supported: false, description: "Not supported in harness_acp_bridge" }],
+    ...(state.methodChosen && state.urlConfirmed ? { authenticated: true } : {}),
+  });
   const server: Server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", chunk => chunks.push(chunk));
@@ -28,24 +40,43 @@ function stubServer() {
           response.end(JSON.stringify({ ok: false, error: { code: "session_not_found", message: "unknown session_id" } }));
           return;
         }
+        if (params.session_id === "cancel-error" || params.session_id === "cancel-plain") {
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: true, data: {
+            session_id: params.session_id, message_id: "m1", state: "cancelled", terminal: true, questions: [],
+            ...(params.session_id === "cancel-error" ? { error: { code: "input_timeout", message: "authentication question timed out" } } : {}),
+          } }));
+          return;
+        }
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(state.answered
           ? { ok: true, data: { session_id: "s1", message_id: "m1", state: "completed", terminal: true, questions: [], result: { text: "final:hello", reasoning: "", tool_calls: [], stop_reason: "end_turn", raw_result: null } } }
-          : { ok: true, data: { session_id: "s1", message_id: "m1", state: "waiting_input", terminal: false, questions: [question] } }));
+          : { ok: true, data: { session_id: "s1", message_id: "m1", state: "waiting_input", terminal: false, questions: [question], progress: { text: SENTINEL } } }));
+        return;
+      }
+      if (method === "authenticate" || method === "auth_status") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, data: authSnapshot() }));
         return;
       }
       if (method === "answer_question") {
-        state.answered = true;
+        if (params.request_id === "q-method") state.methodChosen = true;
+        else if (params.request_id === "q-url") state.urlConfirmed = true;
+        else state.answered = true;
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, data: { session_id: "s1", message_id: "m1", request_id: params.request_id, answered: true } }));
+        response.end(JSON.stringify({ ok: true, data: { session_id: "s1", request_id: params.request_id, answered: true } }));
+        return;
+      }
+      if (method === "create_session" && params.model_id === "needs-auth") {
+        response.writeHead(403, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, error: { code: "authentication_required", message: "Authentication is required. Call authenticate with this session_id and complete the returned questions.", detail: { session_id: "s-auth", next_action: { method: "authenticate", params: { session_id: "s-auth" } } } } }));
         return;
       }
       const bodies: Record<string, unknown> = {
-        ping: { ok: true, data: { status: "ok", protocol_version: 2, sessions: 0 } },
+        ping: { ok: true, data: { status: "ok", protocol_version: 3, sessions: 0 } },
         search_harness: { ok: true, data: { harnesses: { fake: {} } } },
         create_session: { ok: true, data: { session_id: "s1", state: "ready" } },
         send_message: { ok: true, data: { message_id: "m1" } },
-        live_output: { ok: true, data: { session_id: "s1", events: [{ type: "answer", text: SENTINEL, seq: 1, timestamp: "now", message_id: "m1", complete: true }], next_cursor: "c1", has_more: false, session_closed: false, terminal: false } },
         cancel_message: { ok: true, data: { state: "cancelled", terminal: true } },
         close_session: { ok: true, data: { session_id: params.session_id, state: "closed" } },
       };
@@ -53,7 +84,7 @@ function stubServer() {
       response.end(JSON.stringify(bodies[method] ?? { ok: false, error: { code: "unsupported_request", message: method } }));
     });
   });
-  return { server, state };
+  return { server, state, AUTH_URL };
 }
 
 const dirs: string[] = [];
@@ -65,7 +96,7 @@ afterEach(async () => {
 });
 
 async function setup(hasUI = true) {
-  const { server, state } = stubServer();
+  const { server, state, AUTH_URL } = stubServer();
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", () => resolve()));
   servers.push(server);
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -97,16 +128,18 @@ async function setup(hasUI = true) {
   await events.get("session_start")!({}, ctx);
   const execute = (name: string, args: unknown, signal?: AbortSignal, onUpdate?: (result: AgentToolResult<Record<string, unknown>>) => void) =>
     tools.get(name)!.execute("call-1", args, signal, onUpdate as never, ctx as ExtensionToolContext) as Promise<AgentToolResult<Record<string, unknown>>>;
-  return { api, tools, events, commands, ctx, messages, execute, state, async cleanup() { await events.get("session_shutdown")!({}, ctx); } };
+  return { api, tools, events, commands, ctx, messages, execute, state, AUTH_URL, async cleanup() { await events.get("session_shutdown")!({}, ctx); } };
 }
 
 describe("Pi tools over the HTTP bridge", () => {
-  it("registers the twelve acp_ tools plus acp_wait and never uses MCP or a new user turn", async () => {
+  it("registers the eleven acp_ tools plus acp_wait and never uses MCP or a new user turn", async () => {
     const host = await setup();
     try {
-      expect(host.tools.size).toBe(13);
+      expect(host.tools.size).toBe(12);
       expect([...host.tools.keys()]).toContain("acp_send_message");
       expect([...host.tools.keys()]).toContain("acp_wait");
+      // live_output is gone and never registered.
+      expect([...host.tools.keys()]).not.toContain("acp_live_output");
       expect([...host.tools.keys()].some(name => name.includes("mcp"))).toBe(false);
       const result = await host.execute("acp_ping", {});
       expect((result.details as { status: string }).status).toBe("ok");
@@ -230,6 +263,80 @@ describe("Pi tools over the HTTP bridge", () => {
       const result = await host.execute("acp_wait", { session_id: "s1", message_id: "m1" });
       expect((result.details as { terminal: boolean }).terminal).toBe(true);
       await expect(host.execute("acp_message_status", { session_id: "invalid", message_id: "m1" })).rejects.toMatchObject({ code: "session_not_found" });
+    } finally { await host.cleanup(); }
+  });
+
+  it("marks a terminal status carrying an error as a tool error, preserving state and error", async () => {
+    const host = await setup(true);
+    try {
+      const result = await host.execute("acp_wait", { session_id: "cancel-error", message_id: "m1" });
+      expect(result.isError).toBe(true);
+      expect((result.details as { state: string }).state).toBe("cancelled");
+      expect((result.details as { error: { code: string } }).error.code).toBe("input_timeout");
+      expect(result.structuredContent).toMatchObject({ state: "cancelled", error: { code: "input_timeout" } });
+    } finally { await host.cleanup(); }
+  });
+
+  it("returns a plain user cancel (no error) as a normal terminal result", async () => {
+    const host = await setup(true);
+    try {
+      const result = await host.execute("acp_wait", { session_id: "cancel-plain", message_id: "m1" });
+      expect(result.isError).toBeFalsy();
+      expect((result.details as { state: string }).state).toBe("cancelled");
+    } finally { await host.cleanup(); }
+  });
+
+  it("drives the auth flow through the UI: method selection, then a full-URL confirm that is not treated as success", async () => {
+    const host = await setup(true);
+    try {
+      // Both the method-selection and the URL-confirm questions are single-choice; the client must
+      // ask the user, never choose for them.
+      vi.mocked(host.ctx.ui.select)
+        .mockResolvedValueOnce('1. "agent"') // method_id
+        .mockResolvedValueOnce("1. true"); // opened confirm
+      const result = await host.execute("acp_authenticate", { session_id: "s1" });
+      expect((result.details as { state: string; terminal: boolean }).state).toBe("ready");
+      expect((result.details as { terminal: boolean }).terminal).toBe(true);
+      expect(host.ctx.ui.select).toHaveBeenCalledTimes(2);
+      const methodTitle = vi.mocked(host.ctx.ui.select).mock.calls[0]![0];
+      expect(methodTitle).toContain("Choose one supported authentication method");
+      // The full, un-truncated URL must be shown to the user.
+      const urlTitle = vi.mocked(host.ctx.ui.select).mock.calls[1]![0];
+      expect(urlTitle).toContain(host.AUTH_URL);
+      // Answers were sent as session-scoped (no message_id) requests with the UI-selected content.
+      const answers = host.state.requests.filter(method => method === "answer_question");
+      expect(answers.length).toBe(2);
+      // Confirming the URL is not success: the flow kept polling auth_status until ready.
+      expect(host.state.requests).toContain("auth_status");
+    } finally { await host.cleanup(); }
+  });
+
+  it("returns waiting_input with the full auth questions and sends no answer when there is no UI", async () => {
+    const host = await setup(false);
+    try {
+      const result = await host.execute("acp_authenticate", { session_id: "s1" });
+      expect((result.details as { state: string }).state).toBe("waiting_input");
+      const questions = result.details!.questions as Array<{ request_id: string }>;
+      expect(questions[0]!.request_id).toBe("q-method");
+      expect(host.ctx.ui.select).not.toHaveBeenCalled();
+      expect(host.state.requests).not.toContain("answer_question");
+    } finally { await host.cleanup(); }
+  });
+
+  it("surfaces a structured authentication_required error from create_session without auto-authenticating", async () => {
+    const host = await setup(true);
+    try {
+      const result = await host.execute("acp_create_session", { cwd: host.ctx.cwd, model_id: "needs-auth" });
+      expect(result.isError).toBe(true);
+      const envelope = result.structuredContent as { ok: boolean; error: { code: string; detail: { session_id: string; next_action: { method: string; params: { session_id: string } } } } };
+      expect(envelope.error.code).toBe("authentication_required");
+      expect(envelope.error.detail.session_id).toBe("s-auth");
+      expect(envelope.error.detail.next_action.method).toBe("authenticate");
+      expect(envelope.error.detail.next_action.params.session_id).toBe("s-auth");
+      // The model-readable text also carries the session id (not only the error message).
+      expect(JSON.stringify(result.content)).toContain("s-auth");
+      // The client never auto-authenticates.
+      expect(host.state.requests).not.toContain("authenticate");
     } finally { await host.cleanup(); }
   });
 });
