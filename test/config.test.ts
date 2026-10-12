@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_SERVER_MODULE, findExecutable, isLoopback, loadSettings, normalizeBaseUrl, resolveServerLaunch, serverEntrySpecifier } from "../src/config.ts";
+import { defaultAskUserPolicy } from "../src/tool-trust.ts";
 
 const dirs: string[] = [];
 function temp(): string { const dir = mkdtempSync(join(tmpdir(), "pi-acp-config-")); dirs.push(dir); return dir; }
@@ -14,7 +15,7 @@ describe("bridge settings", () => {
     const dir = temp();
     expect(loadSettings(dir, { PI_CODING_AGENT_DIR: dir })).toEqual({
       baseUrl: "http://127.0.0.1:8787", requestTimeoutMs: 900_000, interactionTimeoutMs: 60_000,
-      pollIntervalMs: 500, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 30_000,
+      pollIntervalMs: 500, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 30_000, askUser: defaultAskUserPolicy(),
     });
   });
 
@@ -38,6 +39,21 @@ describe("bridge settings", () => {
     expect(loadSettings(dir, { PI_CODING_AGENT_DIR: global })).toMatchObject({ baseUrl: "http://127.0.0.1:2222", pollIntervalMs: 700 });
   });
 
+  it("merges askUser fields without resetting a global source allowlist", () => {
+    const dir = temp(); const global = join(dir, "agent"); mkdirSync(global); mkdirSync(join(dir, ".pi"));
+    writeFileSync(join(global, "harness-acp-bridge.json"), JSON.stringify({ askUser: { sources: [], minVersion: "0.1.4" } }));
+    writeFileSync(join(dir, ".pi", "harness-acp-bridge.json"), JSON.stringify({ askUser: { minVersion: "0.1.5" } }));
+    expect(loadSettings(dir, { PI_CODING_AGENT_DIR: global }).askUser).toMatchObject({ sources: [], minVersion: "0.1.5" });
+  });
+  it("loads interaction tool trust settings and rejects malformed policies", () => {
+    const dir = temp(); const path = join(dir, "settings.json");
+    writeFileSync(path, JSON.stringify({ askUser: { toolName: "official_ask_user", sources: [], minVersion: "0.1.5", minVersionExclusive: true } }));
+    expect(loadSettings(dir, { PI_ACP_BRIDGE_SETTINGS: path }).askUser).toEqual({
+      toolName: "official_ask_user", sources: [], minVersion: "0.1.5", minVersionExclusive: true,
+    });
+    writeFileSync(path, JSON.stringify({ askUser: { minVersion: "^0.1.4" } }));
+    expect(() => loadSettings(dir, { PI_ACP_BRIDGE_SETTINGS: path })).toThrow("askUser.minVersion");
+  });
   it("honors HARNESS_ACP_BRIDGE_CONFIG for the server config path", () => {
     const dir = temp();
     expect(loadSettings(dir, { PI_CODING_AGENT_DIR: dir, HARNESS_ACP_BRIDGE_CONFIG: "config.yaml" }).configPath).toBe(join(dir, "config.yaml"));

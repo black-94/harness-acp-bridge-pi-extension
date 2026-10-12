@@ -1,6 +1,20 @@
-import { vi } from "vitest";
-import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { afterAll, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionToolContext, ToolInfo } from "@earendil-works/pi-coding-agent";
+import { AskUserToolVerifier, ASK_USER_PACKAGE } from "../src/tool-trust.ts";
 import type { Question } from "../src/interactions.ts";
+
+const askPackageRoot = mkdtempSync(join(tmpdir(), "pi-acp-ask-user-"));
+writeFileSync(join(askPackageRoot, "package.json"), JSON.stringify({ name: ASK_USER_PACKAGE, version: "0.1.4" }));
+writeFileSync(join(askPackageRoot, "index.ts"), "export default () => {};\n");
+afterAll(() => rmSync(askPackageRoot, { recursive: true, force: true }));
+export const askToolInfo = {
+  name: "ask_user", description: "Ask a user", parameters: { type: "object", properties: {} }, exposure: "direct",
+  sourceInfo: { path: join(askPackageRoot, "index.ts"), source: `npm:${ASK_USER_PACKAGE}`, scope: "user", origin: "package", baseDir: askPackageRoot },
+} as ToolInfo;
+export function askVerifier(): AskUserToolVerifier { return new AskUserToolVerifier(() => [askToolInfo]); }
 
 export function context(overrides: Partial<ExtensionToolContext> = {}): ExtensionToolContext {
   return {

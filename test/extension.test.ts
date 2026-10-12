@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { visibleWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionToolContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import extension from "../index.ts";
-import { context } from "./helpers.ts";
+import { context, askToolInfo } from "./helpers.ts";
 
 const SENTINEL = "PREVIEW-SENTINEL-DO-NOT-ENTER-CONTEXT";
 
@@ -169,6 +169,24 @@ describe("Pi tools over the HTTP bridge", () => {
       expect(JSON.stringify(previewUpdate!.content)).not.toContain(SENTINEL);
       expect(JSON.stringify(previewUpdate!.structuredContent)).not.toContain(SENTINEL);
       expect(host.messages).not.toHaveBeenCalled();
+    } finally { await host.cleanup(); }
+  });
+
+  it.each([true, false])("checks Pi provenance before nested tool execution (trusted=%s)", async trusted => {
+    const host = await setup();
+    try {
+      const info = structuredClone(askToolInfo);
+      if (!trusted) info.sourceInfo.source = "npm:@other/pi-ask-user";
+      const lookup = vi.spyOn(host.api, "getAllTools").mockReturnValue([info]);
+      Object.assign(host.ctx, { tools: [{ name: "ask_user" }] });
+      vi.mocked(host.ctx.executeTool).mockResolvedValue({ result: { content: [], details: {
+        status: "answered", answers: [{ id: "permission", selections: ["1. Allow [allow_once]"] }],
+      } }, isError: false, toolCall: { type: "toolCall", id: "nested", name: "ask_user", arguments: {} } } as never);
+      vi.mocked(host.ctx.ui.select).mockResolvedValue("1. Allow [allow_once]");
+      const result = await host.execute("acp_send_message", { session_id: "s1", text: "hello" });
+      expect(result.details!.terminal).toBe(true); expect(lookup).toHaveBeenCalled();
+      if (trusted) { expect(host.ctx.executeTool).toHaveBeenCalledOnce(); expect(host.ctx.ui.select).not.toHaveBeenCalled(); }
+      else { expect(host.ctx.executeTool).not.toHaveBeenCalled(); expect(host.ctx.ui.select).toHaveBeenCalledOnce(); }
     } finally { await host.cleanup(); }
   });
 

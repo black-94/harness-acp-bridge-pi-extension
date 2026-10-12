@@ -64,6 +64,7 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 | `serverEntry` | — | 显式指定启动本地服务时加载的 **server 模块**（或路径 / `file:` URL）。相对路径按 `ctx.cwd` 解析；必须导出 `HarnessHttpServer`/`loadConfig` 的 server 入口（包 `index`），**不是** `hacpd`（`dist/main.js`）这类 CLI。一旦设置即为最终选择：绝不静默忽略，也不回退探测 PATH/依赖 |
 | `configPath` | 环境变量 / 默认 | 传给所启动服务的 YAML 配置路径 |
 | `startupTimeoutMs` | `30000` | 等待所启动服务响应 `ping` 的上限 |
+| `askUser` | 见下文 | 可选交互工具的名称、来源白名单和版本下限（Pi 专属 JSON） |
 
 **共用的环境变量（env 覆盖 JSON 与默认值）：**
 
@@ -167,8 +168,9 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 
 ## 反向交互
 
-1. 在原工具执行上下文中，有可调用的 `ask_user` 时经 `ctx.executeTool()` 调用；否则用 Pi 原生
-   `ctx.ui.select/input`（TUI 弹窗；RPC 经 Extension UI 协议）。
+1. 在原工具执行上下文中，配置的交互工具可调用且通过工具名、Pi 来源元数据、实际安装包名称和
+   最低版本校验后，才经 `ctx.executeTool()` 调用。校验不符时**不调用、不直接报错**，提示原因后
+   降级到 Pi 原生 `ctx.ui.select/input`（TUI 弹窗；RPC 经 Extension UI 协议）；无 UI 则保留 `waiting_input`。
 2. 权限选项按索引精确映射回 `optionId`；拒绝选项原样选择，不推测、不默许。
 3. 信息 / form elicitation 的对象字段生成输入或选择题，数字 / 布尔 / JSON 还原类型并做 JSON
    Schema 校验；无法拆分的表单要求输入完整 JSON 对象。默认值仅作提示，不静默提交。
@@ -177,6 +179,70 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 5. `ask_user` 采用 [pi-ask-user](https://github.com/black-94/pi-ask-user) 的结构化结果契约；
    人类可读文本不会被当作答案。取消 / 超时不会二次提问；只有 UI 尚未启动的
    unavailable/not_initialized 可回退到原生 UI。
+
+字段类型严格按 schema 与 pi-ask-user 契约映射，受限选择一律 `allowFreeText: false`：
+
+| schema 属性 | `ask_user` 字段 | 还原 |
+| --- | --- | --- |
+| 无枚举 `boolean` | `bool` | 真布尔值，`false` 不被丢弃 |
+| `enum` / `const`（含布尔枚举） | `single` | 按标签映射回原始类型值，限制不被放宽 |
+| `array` + `items.enum` / `items.const` | `multi` | typed 数组；schema 要求的数组可回退为空 `[]` |
+| `string` / `number` / `integer` / 自由 `array` | `input` | 数字 / JSON 还原后再做 Ajv 校验 |
+
+可安全表达的平面对象聚合成**单个** `simple-form`（1..10 字段）：`name` 为安全字面键，`label`
+（schema `title`，不含 `description`）与选项标签 ≤ 80 字符，可选字段留空即省略，`required` 空值被拒。
+`schema.description` 不截断：选项字段经选项 `preview`（≤ 4000）完整承载，bool/input 字段经 `prompt`
+（≤ 500）承载；承载不下则退回原生 UI，绝不截断用户决策所需的说明 / URL。
+
+降级为**整对象 JSON `input`** 的情形：嵌套 / 组合 schema、> 10 字段、不合法字段名。该 `input` 的
+`prompt`（≤ 500）会列出期望字段与原始 schema，承载不下则退回原生 UI。另有两条独立降级：某字段
+选项 **> 5**（超出 `ask_user` 选项上限）直接退回原生 UI（仍为 form 逐字段，而非整对象 JSON）；唯一
+上下文放不进 prompt 且无 `preview` 承载时同样退回原生 UI。原生回退中，bool/single 的可选字段提供
+明确的跳过项，multi 会把全部编号候选（原始值，不截断）显示在输入框标题里。schema `default` 仅作
+原生占位提示，绝不自动提交。
+
+### 交互工具来源与版本校验
+
+本扩展不自动安装或加载 `pi-ask-user`；未加载时照常使用原生 UI。可选安装：
+
+```sh
+pi install npm:@black942026/pi-ask-user
+```
+
+默认策略（写在 `harness-acp-bridge.json`，没有独立环境变量）：
+
+```json
+{
+  "askUser": {
+    "toolName": "ask_user",
+    "sources": ["npm:@black942026/pi-ask-user"],
+    "minVersion": "0.1.4",
+    "minVersionExclusive": false
+  }
+}
+```
+
+- `toolName` 精确匹配，绝不寻找名称相似的工具。
+- `sources` 是来源白名单，不是工具描述或返回结果的自报信息。每次调用前重新查询
+  `pi.getAllTools().sourceInfo`；缺失、不明确或不可读取时拒绝使用可选工具。
+- 默认只允许指定 npm **包名**；无版本的 npm 白名单项也接受该准确包名的版本/range/tag 来源。
+  不接受包名前缀碰撞、npm alias、其他包或任意本地同名文件。指定了 npm 版本/range 时，实际
+  安装版本还必须匹配 Pi 记录的 selector。
+- 从真实扩展路径读取最近的 `package.json`，核对 `name === "@black942026/pi-ask-user"` 与实际
+  `version`，而不是拿来源字符串中的版本当作已安装版本。入口及 manifest 的 realpath 不得
+  逃出 Pi 记录的来源目录；无法读取 manifest 时同样降级。
+- `minVersion` 是完整 SemVer 下限，默认 **`>=0.1.4`**，更高稳定版本无需逐个加入列表。
+  `minVersionExclusive: true` 改为严格 `>`。按 SemVer 比较，不按字符串字典序；稳定下限默认
+  不接受预发布版本。这里是包版本校验，不代表未来版本的接口永远兼容，结果仍需结构化校验。
+- Git 来源需要把 Pi 记录的完整来源（包括 ref）显式加入 `sources`；本地开发可加入
+  `"path:/absolute/path/to/pi-ask-user/index.ts"`，只允许这个真实入口文件，且仍核对包名和版本。
+  `sources: []` 禁用可选工具，始终使用原生 UI。这里不支持通配符。
+- 项目配置按 `askUser` 的子字段覆盖全局配置；`sources` 数组整体替换，不自动追加。
+  无匹配/来源不明/版本不符只会在调用前告警并使用原生 UI；无 UI 保留问题供手动回答。
+
+这是宿主提供的**加载来源校验**，不是发布者签名或对恶意扩展的进程隔离。所有已加载扩展
+共享 Pi 进程权限，来源白名单不能替代安装前审查。已经调用工具后的取消、超时或未知返回
+不会再次弹窗；只有 UI 尚未启动的 `unsupported_mode`/`not_initialized` 才可回退。
 
 ### 无 UI、取消与输出
 
@@ -236,9 +302,15 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 ```bash
 npm run dev:setup         # 干净安装 + Pi 开发依赖安全修补
 npm run check             # 类型检查 + 测试（含真实 server + mock harness 端到端）
+npm run test:protocol     # 可选：用相邻 ../pi-ask-user 的真实 normalizer 交叉校验 ask_user 参数
 npm audit --omit=dev
 npm pack --dry-run
 ```
+
+默认 `npm test` 完全自包含（不依赖相邻 `../pi-ask-user` 检出）：反向交互参数用
+`test/ask-user-contract.ts`（pi-ask-user `AskUserParams` 的严格镜像）校验。若需用真实 normalizer
+复核，额外检出 `../pi-ask-user` 后运行 `npm run test:protocol`（属 `test/protocol/`，不进入默认
+`npm test`）。
 
 `npm run check` 会按需启动**真实 HTTP server**与 server 仓库的 mock ACP harness（不调用真实模型、不用
 Docker/SSH），驱动创建会话 / 提交 / 同步等待 / 结果 / 权限弹窗 / 认证流程（未登录 `create_session` →

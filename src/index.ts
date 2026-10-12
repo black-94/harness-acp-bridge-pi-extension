@@ -11,6 +11,7 @@ import { MessageMonitor, type MessageRef } from "./monitor.ts";
 import { collectSecrets, redactValue } from "./redact.mjs";
 import { renderAcpResult } from "./render.ts";
 import { OUTPUT_SCHEMA, TOOL_SPECS, WAIT_SCHEMA } from "./schemas.ts";
+import { AskUserToolVerifier } from "./tool-trust.ts";
 
 const watchEntry = "harness-acp-bridge-watch";
 
@@ -149,7 +150,7 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
         const settings = loadSettings(ctx!.cwd);
         client = new BridgeHttpClient(settings);
         lifecycle = new ServerLifecycle(settings, process.env, ctx!.cwd);
-        router = new InteractionRouter(settings.interactionTimeoutMs);
+        router = new InteractionRouter(settings.interactionTimeoutMs, new AskUserToolVerifier(() => pi.getAllTools(), settings.askUser));
         pollIntervalMs = settings.pollIntervalMs;
         monitor = new MessageMonitor(client, router, ctx!, settings.pollIntervalMs, ref => remember(ref, false));
       }

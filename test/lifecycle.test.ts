@@ -8,7 +8,8 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { ServerLifecycle, redact } from "../src/lifecycle.ts";
 import type { BridgeSettings } from "../src/config.ts";
-import { fakeHarness, newContractServerCli, newContractServerEntry, serverSpawningAvailable } from "./server-build.ts";
+import { defaultAskUserPolicy } from "../src/tool-trust.ts";
+import { newContractServerCli, newContractServerEntry, serverSpawningAvailable } from "./server-build.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
@@ -22,7 +23,7 @@ async function freePort(): Promise<number> {
 }
 
 function settings(baseUrl: string, overrides: Partial<BridgeSettings> = {}): BridgeSettings {
-  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: newContractServerEntry(), configPath: null, startupTimeoutMs: 15000, ...overrides };
+  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: newContractServerEntry(), configPath: null, startupTimeoutMs: 15000, askUser: defaultAskUserPolicy(), ...overrides };
 }
 
 function registry(dir: string): Record<string, { pid: number | null }> {
@@ -49,7 +50,7 @@ describe("managed local server lifecycle", () => {
       sessions: { max_concurrency: 4, reap_interval_seconds: 1 },
       timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 2, turn_timeout_seconds: 8, turn_cancel_timeout_seconds: 0.5, terminate_grace_seconds: 0.1, remote_cleanup_timeout_seconds: 0.1, authentication_timeout_seconds: 1 },
       authentication: { rate_limit: { enabled: false } }, default_harness: "codebuddy",
-      harnesses: { codebuddy: { command: process.execPath, args: [fakeHarness], models: [{ id: "fake-model" }] } },
+      harnesses: { codebuddy: { models: [{ id: "fake-model" }] } },
     }));
     cleanups.push(() => { for (const entry of Object.values(registry(clientDir))) if (entry.pid) { try { process.kill(entry.pid, "SIGTERM"); } catch { /* gone */ } } rmSync(dir, { recursive: true, force: true }); });
     const env = { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir };
@@ -113,7 +114,7 @@ describe("managed local server lifecycle", () => {
       sessions: { max_concurrency: 4, reap_interval_seconds: 1 },
       timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 2, turn_timeout_seconds: 8, turn_cancel_timeout_seconds: 0.5, terminate_grace_seconds: 0.1, remote_cleanup_timeout_seconds: 0.1, authentication_timeout_seconds: 1 },
       authentication: { rate_limit: { enabled: false } }, default_harness: "codebuddy",
-      harnesses: { codebuddy: { command: process.execPath, args: [fakeHarness], models: [{ id: "fake-model" }] } },
+      harnesses: { codebuddy: { models: [{ id: "fake-model" }] } },
     }));
     const marker = join(dir, "hijack.marker");
     const evil = join(dir, "evil-command.cjs");
@@ -146,7 +147,7 @@ describe.runIf(serverSpawningAvailable() && newContractServerCli() !== null)("ma
       sessions: { max_concurrency: 4, reap_interval_seconds: 1 },
       timeouts: { startup_timeout_seconds: 5, request_timeout_seconds: 2, turn_timeout_seconds: 8, turn_cancel_timeout_seconds: 0.5, terminate_grace_seconds: 0.1, remote_cleanup_timeout_seconds: 0.1, authentication_timeout_seconds: 1 },
       authentication: { rate_limit: { enabled: false } }, default_harness: "codebuddy",
-      harnesses: { codebuddy: { command: process.execPath, args: [fakeHarness], models: [{ id: "fake-model" }] } },
+      harnesses: { codebuddy: { models: [{ id: "fake-model" }] } },
     }));
     return config;
   }

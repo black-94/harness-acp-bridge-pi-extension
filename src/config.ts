@@ -9,6 +9,7 @@ import { accessSync, constants, readFileSync, realpathSync, statSync } from "nod
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { parseAskUserPolicy, type AskUserPolicy } from "./tool-trust.ts";
 
 export const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
 export const DEFAULT_REQUEST_TIMEOUT_MS = 900_000;
@@ -29,6 +30,8 @@ export interface BridgeSettings {
   /** Explicit server YAML config path, or null to honor HARNESS_ACP_BRIDGE_CONFIG/defaults. */
   configPath: string | null;
   startupTimeoutMs: number;
+  /** Caller tool identity/provenance and the minimum compatible installed package version. */
+  askUser: AskUserPolicy;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -113,7 +116,7 @@ export function resolveServerLaunch(settings: Pick<BridgeSettings, "serverEntry"
   return { kind: "module", specifier: DEFAULT_SERVER_MODULE };
 }
 
-const SETTING_KEYS = ["baseUrl", "requestTimeoutMs", "interactionTimeoutMs", "pollIntervalMs", "autoStart", "serverEntry", "configPath", "startupTimeoutMs"] as const;
+const SETTING_KEYS = ["baseUrl", "requestTimeoutMs", "interactionTimeoutMs", "pollIntervalMs", "autoStart", "serverEntry", "configPath", "startupTimeoutMs", "askUser"] as const;
 
 function positiveInteger(value: unknown, source: string, name: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 2_147_483_647) {
@@ -171,7 +174,9 @@ export function loadSettings(cwd: string, env: NodeJS.ProcessEnv = process.env):
     for (const key of Object.keys(data)) {
       if (!(SETTING_KEYS as readonly string[]).includes(key)) throw new Error(`${path}: unknown setting ${key}`);
     }
+    const previousAskUser = file.askUser;
     Object.assign(file, data);
+    if (isRecord(previousAskUser) && isRecord(data.askUser)) file.askUser = { ...previousAskUser, ...data.askUser };
   }
 
   const rawBaseUrl = env.HARNESS_ACP_BRIDGE_URL ?? file.baseUrl ?? DEFAULT_BASE_URL;
@@ -199,5 +204,6 @@ export function loadSettings(cwd: string, env: NodeJS.ProcessEnv = process.env):
   const interactionTimeoutMs = file.interactionTimeoutMs !== undefined ? positiveInteger(file.interactionTimeoutMs, "settings", "interactionTimeoutMs") : DEFAULT_INTERACTION_TIMEOUT_MS;
   const pollIntervalMs = file.pollIntervalMs !== undefined ? positiveInteger(file.pollIntervalMs, "settings", "pollIntervalMs") : DEFAULT_POLL_INTERVAL_MS;
 
-  return { baseUrl, requestTimeoutMs, interactionTimeoutMs, pollIntervalMs, autoStart, serverEntry, configPath, startupTimeoutMs };
+  const askUser = parseAskUserPolicy(file.askUser);
+  return { baseUrl, requestTimeoutMs, interactionTimeoutMs, pollIntervalMs, autoStart, serverEntry, configPath, startupTimeoutMs, askUser };
 }

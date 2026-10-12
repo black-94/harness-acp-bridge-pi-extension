@@ -51,12 +51,19 @@ describe.runIf(serverSpawningAvailable())("Pi client against a real server it st
       authentication: { rate_limit: { enabled: false } },
       default_harness: "codebuddy",
       harnesses: {
-        codebuddy: { command: process.execPath, args: [fakeHarness], models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2" }] },
+        codebuddy: { models: [{ id: "fake-model", thinking_levels: ["low", "high"] }, { id: "fake-model-2" }] },
         // The built-in `codex` adapter drives the fake harness's device-code URL elicitation, so the
         // auth e2e exercises the real CodexAdapter normalization (not a custom alias).
-        codex: { command: process.execPath, args: [fakeHarness, "--auth-methods"], models: [{ id: "fake-model" }] },
+        codex: { models: [{ id: "fake-model" }] },
       },
     }));
+    // Harness commands now come from templates or target PATH, never YAML launch settings.
+    const bin = join(dir, "bin"); mkdirSync(bin);
+    const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+    for (const [command, flags] of [["codebuddy", ""], ["codex-acp", "--fake-agent=codex --auth-methods"]]) {
+      writeFileSync(join(bin, command), `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fakeHarness)} ${flags} "$@"\n`, { mode: 0o755 });
+    }
+    vi.stubEnv("PATH", `${bin}:${process.env.PATH ?? ""}`);
     vi.stubEnv("HARNESS_ACP_BRIDGE_CLIENT_DIR", clientDir);
     vi.stubEnv("PI_CODING_AGENT_DIR", join(dir, "agent"));
 

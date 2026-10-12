@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { MessageMonitor } from "../src/monitor.ts";
 import { InteractionRouter } from "../src/interactions.ts";
-import { context, askContext, permission } from "./helpers.ts";
+import { context, askContext, permission, askVerifier } from "./helpers.ts";
 import type { BridgeConnection } from "../src/client.ts";
 
 const ref = { session_id: "s1", message_id: "m1" };
@@ -30,7 +30,7 @@ function harness(options: { ui?: boolean; progress?: boolean } = {}) {
   };
   const ctx = context({ hasUI: options.ui ?? true });
   const settled = vi.fn();
-  const monitor = new MessageMonitor(connection, new InteractionRouter(100), ctx, 5, settled);
+  const monitor = new MessageMonitor(connection, new InteractionRouter(100, askVerifier()), ctx, 5, settled);
   return { monitor, calls, ctx, state, settled, finish: () => { state.terminal = true; } };
 }
 

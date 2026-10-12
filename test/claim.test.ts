@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BridgeSettings } from "../src/config.ts";
+import { defaultAskUserPolicy } from "../src/tool-trust.ts";
 import { ServerLifecycle } from "../src/lifecycle.ts";
 
 /**
@@ -27,7 +28,7 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 function settings(baseUrl: string, overrides: Partial<BridgeSettings> = {}): BridgeSettings {
-  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 1, ...overrides };
+  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 1, askUser: defaultAskUserPolicy(), ...overrides };
 }
 
 describe("startLocal launcher-proof ownership", () => {

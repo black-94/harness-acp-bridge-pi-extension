@@ -6,5 +6,11 @@
   "autoStart": true,
   "serverEntry": null,
   "configPath": null,
-  "startupTimeoutMs": 30000
+  "startupTimeoutMs": 30000,
+  "askUser": {
+    "toolName": "ask_user",
+    "sources": ["npm:@black942026/pi-ask-user"],
+    "minVersion": "0.1.4",
+    "minVersionExclusive": false
+  }
 }

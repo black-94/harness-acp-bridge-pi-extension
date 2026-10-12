@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { InteractionRouter } from "../src/interactions.ts";
-import { context, askContext, permission, information } from "./helpers.ts";
+import { context, askContext, permission, information, askVerifier, askToolInfo } from "./helpers.ts";
+import { AskUserToolVerifier, defaultAskUserPolicy } from "../src/tool-trust.ts";
 
 const signal = (): AbortSignal => new AbortController().signal;
-const router = (): InteractionRouter => new InteractionRouter(100);
+const router = (): InteractionRouter => new InteractionRouter(100, askVerifier());
 
 describe("ACP reverse interactions", () => {
   it("prefers ask_user and maps labels back to permission option ids", async () => {
@@ -28,6 +29,37 @@ describe("ACP reverse interactions", () => {
       toolCall: { type: "toolCall", id: "nested", name: "ask_user", arguments: {} },
     } as never);
     await expect(router().resolve(permission(), ctx, signal(), ctx)).rejects.toThrow("structured answer");
+  });
+  it.each(["missing", "wrong-source", "wrong-name", "minimum-version"])("does not call an untrusted tool (%s) and falls back before any tool UI", async failure => {
+    const ctx = askContext({ status: "answered" });
+    const info = structuredClone(askToolInfo);
+    if (failure === "missing") Object.assign(info, { sourceInfo: undefined });
+    if (failure === "wrong-source") info.sourceInfo.source = "npm:@other/pi-ask-user";
+    if (failure === "wrong-name") info.name = "unrelated_tool";
+    const policy = { ...defaultAskUserPolicy(), ...(failure === "minimum-version" ? { minVersion: "9.0.0" } : {}) };
+    const handler = new InteractionRouter(100, new AskUserToolVerifier(() => [info], policy));
+    vi.mocked(ctx.ui.select).mockResolvedValue("2. Reject [reject_once]");
+    expect(await handler.resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "deny" });
+    expect(ctx.executeTool).not.toHaveBeenCalled(); expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("was not called"), "warning");
+  });
+  it("still uses native UI if the trust warning cannot be displayed", async () => {
+    const ctx = askContext({ status: "answered" });
+    vi.mocked(ctx.ui.notify).mockImplementation(() => { throw new Error("warning UI unavailable"); });
+    vi.mocked(ctx.ui.select).mockResolvedValue("2. Reject [reject_once]");
+    expect(await new InteractionRouter(100).resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "deny" });
+    expect(ctx.executeTool).not.toHaveBeenCalled();
+  });
+  it("leaves a question pending without UI when tool provenance cannot be verified", async () => {
+    const ctx = askContext({ status: "answered" }); Object.assign(ctx, { hasUI: false });
+    expect(await new InteractionRouter(100).resolve(permission(), ctx, signal(), ctx)).toBeUndefined();
+    expect(ctx.executeTool).not.toHaveBeenCalled(); expect(ctx.ui.select).not.toHaveBeenCalled();
+  });
+  it("uses the configured exact tool name only", async () => {
+    const ctx = askContext({ status: "answered", answers: [{ id: "permission", selections: ["1. Allow [allow_once]"] }] });
+    Object.assign(ctx, { tools: [{ name: "official_ask_user" }] });
+    const handler = new InteractionRouter(100, new AskUserToolVerifier(() => [{ ...askToolInfo, name: "official_ask_user" }], { ...defaultAskUserPolicy(), toolName: "official_ask_user" }));
+    expect(await handler.resolve(permission(), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "allow" });
+    expect(ctx.executeTool).toHaveBeenCalledWith("official_ask_user", expect.any(Object), expect.any(Object));
   });
   it("falls back to native select when ask_user is not callable", async () => {
     const ctx = context();
@@ -67,17 +99,29 @@ describe("ACP reverse interactions", () => {
     expect(await router().resolve(permission({ options }), ctx, signal(), ctx)).toEqual({ answer: "accept", option_id: "5" });
     expect(ctx.executeTool).not.toHaveBeenCalled();
   });
-  it("collects and validates typed information fields via ask_user", async () => {
+  it("collects and validates a flat typed object as a simple-form (real false preserved)", async () => {
     const ctx = askContext({ status: "answered", answers: [
-      { id: "field_0", freeText: "hello", selections: [] },
-      { id: "field_1", selections: ["2. false"] },
-      { id: "field_2", freeText: "3", selections: [] },
+      { id: "form", selections: [], value: { name: "hello", ready: false, count: "3" } },
     ] });
     const request = information({ type: "object", properties: {
       name: { type: "string" }, ready: { type: "boolean" }, count: { type: "integer" },
     }, required: ["name", "ready", "count"] });
     expect(await router().resolve(request, ctx, signal(), ctx))
       .toEqual({ answer: "accept", content: { name: "hello", ready: false, count: 3 } });
+    const payload = vi.mocked(ctx.executeTool).mock.calls[0]![1] as {
+      allowFreeText?: boolean;
+      questions: Array<{ kind: string; fields?: Array<{ name: string; kind: string }> }>;
+    };
+    // Free text is disabled so a supplemental note can never change a decision, and a real boolean
+    // field keeps `false` as a complete answer rather than collapsing it to an empty selection.
+    expect(payload.allowFreeText).toBe(false);
+    expect(payload.questions).toHaveLength(1);
+    expect(payload.questions[0]!.kind).toBe("simple-form");
+    expect(payload.questions[0]!.fields).toEqual([
+      { name: "name", label: "name", kind: "input", required: true },
+      { name: "ready", label: "ready", kind: "bool", required: true },
+      { name: "count", label: "count", kind: "input", required: true },
+    ]);
   });
   it("collects typed fields through native input and select", async () => {
     const ctx = context();
@@ -135,17 +179,19 @@ describe("ACP reverse interactions", () => {
 
   it("keeps a long auth URL fully in the option preview and caps the ask_user prompt at 500", async () => {
     const url = `https://auth.example.com/login?state=${"a".repeat(600)}&scope=openid`;
-    const ctx = askContext({ status: "answered", answers: [{ id: "field_0", selections: ["1. true"] }] });
+    const ctx = askContext({ status: "answered", answers: [{ id: "form", selections: [], value: { opened: "1. true" } }] });
     const question = information({ type: "object", properties: { opened: { type: "boolean", enum: [true] } }, required: ["opened"] });
     question.message = `Open this URL and complete authentication, then confirm here: ${url}`;
-    // A boolean-enum confirm question is a single choice presented via ask_user.
+    // A restricted boolean (enum/const) is a single choice presented via ask_user, not a free bool.
     expect(await router().resolve(question, ctx, signal(), ctx)).toEqual({ answer: "accept", content: { opened: true } });
-    const payload = vi.mocked(ctx.executeTool).mock.calls[0]![1] as { questions: Array<{ prompt?: string; options?: Array<{ preview?: string }> }> };
+    const payload = vi.mocked(ctx.executeTool).mock.calls[0]![1] as {
+      questions: Array<{ prompt?: string; fields?: Array<{ kind: string; options?: Array<{ preview?: string }> }> }>;
+    };
     expect(payload.questions).toHaveLength(1);
     // The real `ask_user` schema rejects prompt > 500, so a legal call must never exceed it.
     expect(payload.questions[0]!.prompt!.length).toBeLessThanOrEqual(500);
     // The full URL survives intact in the option preview (preview limit is 4000).
-    const preview = payload.questions[0]!.options![0]!.preview!;
+    const preview = payload.questions[0]!.fields![0]!.options![0]!.preview!;
     expect(preview).toContain(url);
     expect(preview.length).toBeLessThanOrEqual(4000);
   });

@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerLifecycle } from "../src/lifecycle.ts";
 import type { BridgeSettings } from "../src/config.ts";
+import { defaultAskUserPolicy } from "../src/tool-trust.ts";
 import { isSensitiveKeyName, redactText, redactValue, StreamRedactor } from "../src/redact.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -127,7 +128,7 @@ describe("Pi stream redactor across arbitrary boundaries", () => {
 // ---------------------------------------------------------------------------
 
 function settings(baseUrl: string, overrides: Partial<BridgeSettings> = {}): BridgeSettings {
-  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 8000, ...overrides };
+  return { baseUrl, requestTimeoutMs: 15000, interactionTimeoutMs: 5000, pollIntervalMs: 200, autoStart: true, serverEntry: null, configPath: null, startupTimeoutMs: 8000, askUser: defaultAskUserPolicy(), ...overrides };
 }
 
 function registry(dir: string): Record<string, { pid: number | null; logger_pid: number | null; log: string; started_at: string }> {
