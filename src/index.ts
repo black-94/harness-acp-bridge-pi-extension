@@ -231,7 +231,8 @@ export default function acpBridgeExtension(pi: ExtensionAPI): void {
       async execute(_id, args, signal) {
         await ensureServer();
         try {
-          const data = await client!.call(tool.name, args as Record<string, unknown>, signal);
+          // `tool.name` is model-facing; `tool.method` is the HTTP method (`create_template` → register_template).
+          const data = await client!.call(tool.method ?? tool.name, args as Record<string, unknown>, signal);
           return toolResult(data, secrets);
         } catch (error) {
           if (isAuthRequired(error)) return authRequiredResult(error);

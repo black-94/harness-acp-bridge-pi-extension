@@ -37,7 +37,7 @@ class HarnessHttpServer {
       const port = this.config && this.config.port;
       server = createServer((_request, response) => {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, data: { status: "ok", protocol_version: 3, pid: process.pid } }));
+        response.end(JSON.stringify({ ok: true, data: { status: "ok", protocol_version: 4, pid: process.pid } }));
       });
       server.listen(port, "127.0.0.1", () => {
         emitCredentials();

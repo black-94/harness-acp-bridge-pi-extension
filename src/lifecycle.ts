@@ -90,7 +90,7 @@ export class ServerLifecycle {
   async probe(): Promise<ProbeResult> {
     try {
       const data = await this.probeClient.call("ping", {});
-      return data.status === "ok" && data.protocol_version === 3 ? "ok" : "incompatible";
+      return data.status === "ok" && data.protocol_version === 4 ? "ok" : "incompatible";
     } catch (error) {
       if (error instanceof BridgeError && error.code === "network_error") return "down";
       return "incompatible";
@@ -100,7 +100,7 @@ export class ServerLifecycle {
   private async probePid(): Promise<number | null> {
     try {
       const data = await this.probeClient.call("ping", {});
-      return data.status === "ok" && data.protocol_version === 3 && typeof data.pid === "number" ? data.pid : null;
+      return data.status === "ok" && data.protocol_version === 4 && typeof data.pid === "number" ? data.pid : null;
     } catch { return null; }
   }
 
@@ -118,7 +118,7 @@ export class ServerLifecycle {
   }
 
   private incompatible(): BridgeError {
-    return new BridgeError("incompatible_server", `a service at ${this.baseUrl} answered but is not a compatible harness-acp-bridge server (protocol 3)`);
+    return new BridgeError("incompatible_server", `a service at ${this.baseUrl} answered but is not a compatible harness-acp-bridge server (protocol 4)`);
   }
 
   private async startLocal(): Promise<EnsureResult> {

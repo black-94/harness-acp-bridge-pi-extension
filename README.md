@@ -109,8 +109,8 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 
 ## 本地服务生命周期
 
-1. `ping` 配置的 `baseUrl`；返回 `protocol_version: 3` 的服务被直接复用。旧协议（例如仍在运行的
-   `protocol_version: 2` daemon）一律视为不兼容并**拒绝**，但**绝不重启、替换或终止**它。
+1. `ping` 配置的 `baseUrl`；返回 `protocol_version: 4` 的服务被直接复用。旧协议（例如仍在运行的
+   `protocol_version: 3` daemon，其 `create_session` 仍引用模板）一律视为不兼容并**拒绝**，但**绝不重启、替换或终止**它。
 2. 若地址被占据但**不是**兼容的 bridge 服务（错误信封、协议版本不符、或非 JSON 监听者），
    扩展报 `incompatible_server` 并且**不**另起服务——外来服务不会被当作“不存在”。
 3. 若无人监听、`autoStart` 为真，且地址是 **loopback**，扩展才启动服务。非 loopback 地址绝不
@@ -128,10 +128,11 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 
 ## 工具
 
-注册 11 个 `acp_` 工具（与服务端同名）加 `acp_wait`：`acp_ping`、`acp_search_harness`、
-`acp_create_session`、`acp_close_session`、`acp_authenticate`、`acp_auth_status`、
-`acp_set_session_options`、`acp_send_message`、`acp_cancel_message`、`acp_message_status`、
-`acp_answer_question`，外加上面的 `acp_wait`。
+注册 11 个 `acp_` 工具（与服务端同名）加两个模板工具、`acp_wait`：`acp_ping`、
+`acp_search_harness`、`acp_search_template`、`acp_create_template`、`acp_create_session`、
+`acp_close_session`、`acp_authenticate`、`acp_auth_status`、`acp_set_session_options`、
+`acp_send_message`、`acp_cancel_message`、`acp_message_status`、`acp_answer_question`，
+外加上面的 `acp_wait`。
 
 - **`acp_send_message`**：提交后在同一调用内同步等待终态（与 `acp_wait` 相同语义）。
 - **`acp_wait`**：只等待已知的 `session_id`/`message_id`，不重复提交；用于 MCP/重载后恢复、无 UI
@@ -146,6 +147,37 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 （`detail.session_id` + `detail.next_action`），由模型调用 `acp_authenticate`；扩展**不会**自动认证。
 服务端仍只接受每会话一个非终态消息，`busy` 等错误原样报告；客户端不排队、不 steer、不重试。网络中断后
 提交可能已生效，用同一 `idempotency_key` 重试可避免重复。
+
+### 启动模板
+
+模板只是**信息**，由服务端持久存储；`acp_create_session` **不再**接受模板引用。本扩展只暴露两个工具：
+
+- **`acp_search_template`**：按精确 `name`、`query`（name/harness/description 的大小写不敏感子串）
+  和/或 `harness` 查找模板，返回**完整内容**供模型自行展开。不启动 harness。
+- **`acp_create_template`**：`{template: {...}}` 持久注册一个模板，是服务端 `register_template`
+  的**客户端别名**（不会 `POST /api/create_template`，也不暴露删除）。**不创建会话、不启动 harness**；
+  重名返回 `template_exists`，绝不覆盖。注册前请按 `acp-create-template` skill 收集信息并与用户确认。
+
+推荐工作流：用户指定模板 → `acp_search_template` 精确搜索（有歧义就让用户选择）→ 读返回内容 →
+**丢弃** `name`/`description` 与不适用字段（例如 direct 会话丢弃全部 Docker 字段）→ 收集模板未提供的
+`model_id`（模板不含模型/思考级别）、可能缺失的 `cwd` 与任何用户覆盖项 → 用这些**显式字段**调用
+`acp_create_session`（`cwd` 与 `model_id` 必填）。模板中值为 `null` 且对会话非法的字段要**省略**而非传
+`null`（例如 local 模板的 `remote_host: null`，`remote_host` 仅 remote 会话传；`cwd` 为 `null` 时改用用户的
+`cwd`）。**绝不**向 `create_session` 传 `template`/`name`/`description`
+（严格 schema 会拒绝）。覆盖 `runtime`/`target` 后需重新检查组合（Docker 字段要求 `runtime: docker`；remote
+目标需要 `remote_host`）。`command`/`args`/`env`/`login_dirs` 现在都是允许的显式会话参数；合并与校验由服务端完成，
+客户端不实现第二套默认值合并。
+
+### acp-create-template skill
+
+`acp_create_template` 的配套指导以**可移植**的 Agent Skills 目录发布：
+[`skills/acp-create-template/SKILL.md`](skills/acp-create-template/SKILL.md)（通过
+`package.json` 的 `pi.skills` 声明，随 npm 包打包）。它指导模型**条件式**收集 `name`/`harness`、
+运行位置（local/remote/remote_host）、direct/Docker、`permission_mode`，可选的 `cwd`/`command`/`args`/
+`env`，以及 Docker 的 image/login_dirs/mounts/ports/network/container_policy；不询问不适用的参数，不索取
+密码/token/secret，明确持久化 `env` 的风险，重名不静默覆盖，创建前展示摘要取得确认，取消/超时/UI 不可用
+时不编造答案；并说明 `model_id` 不属于模板、创建模板不会启动会话。MCP 宿主可按 Agent Skills 规范直接加载
+同一目录（`SKILL.md` 是纯 Markdown，无需 Pi 运行时），对应的可执行工具是 bare `create_template`。
 
 ## 认证
 
@@ -314,14 +346,19 @@ npm pack --dry-run
 
 `npm run check` 会按需启动**真实 HTTP server**与 server 仓库的 mock ACP harness（不调用真实模型、不用
 Docker/SSH），驱动创建会话 / 提交 / 同步等待 / 结果 / 权限弹窗 / 认证流程（未登录 `create_session` →
-方法选择 → URL/令牌回答 → `auth_status` 成功）/ 取消 / 无 UI / shutdown 不杀复用实例等链路。集成与
-生命周期测试优先加载**仓库内 server 构建**（`../server/dist`，`serverEntry` 指向其模块入口），仅在
-父检出缺失时回退到已安装包；因为客户端要求 `protocol_version: 3`，这些用例在 server 以新契约重建前
+方法选择 → URL/令牌回答 → `auth_status` 成功）/ 取消 / 无 UI / shutdown 不杀复用实例，以及模板流程
+（`acp_create_template` → `acp_search_template` 按 name/query/harness 查找 → 把允许字段展开为**显式**
+`acp_create_session`（继承 cwd 再覆盖、command/args/env 真实运行）→ `template` 引用 / 重名 / 未知 / 非法模板
+/ 缺 cwd / 启动内部字段被拒）等链路。harness 命令现在来自显式 `command`/`args`/`env` 或执行目标 `PATH`，
+无模板用例仍为 fake harness 安装 PATH wrapper。
+集成与生命周期测试优先加载**仓库内 server 构建**（`../server/dist`，`serverEntry` 指向其模块入口），仅在
+父检出缺失时回退到已安装包；因为客户端要求 `protocol_version: 4`，这些用例在 server 以新契约重建前
 会**跳过**（不会对旧的已安装 server 假绿）。用 `ACP_BRIDGE_SERVER_DIR` 指向 server 检出（默认
 `../server`）。
 
-本扩展以 TypeScript 源码发布，由 Pi 加载，无需 `dist`。`pi-package` 用于扩展目录发现，
-`pi-extension` 标识扩展类型；Pi 提供的包仅声明为 peerDependencies。
+本扩展以 TypeScript 源码发布，由 Pi 加载，无需 `dist`；`skills/` 目录（`acp-create-template`）随包发布，
+由 `pi.skills` 声明以供发现。`pi-package` 用于扩展目录发现，`pi-extension` 标识扩展类型；Pi 提供的包仅
+声明为 peerDependencies。
 
 Pi `1.0.0` 自带 shrinkwrap，将开发依赖 `brace-expansion` 锁在有漏洞的 `5.0.9`；`npm run
 dev:setup` 在 `npm ci --ignore-scripts` 后运行 `fix:dev-deps` 修补该开发依赖（不进入发布包、不

@@ -93,7 +93,7 @@ function stubServer(mode: "interactive" | "running" = "interactive") {
       }
       if (method === "send_message") state.sendCalls++;
       const bodies: Record<string, unknown> = {
-        ping: { ok: true, data: { status: "ok", protocol_version: 3, sessions: 0 } },
+        ping: { ok: true, data: { status: "ok", protocol_version: 4, sessions: 0 } },
         send_message: { ok: true, data: { message_id: MESSAGE_ID } },
         cancel_message: { ok: true, data: { state: "cancelled", terminal: true } },
         close_session: { ok: true, data: { session_id: params.session_id, state: "closed" } },

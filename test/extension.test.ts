@@ -73,8 +73,10 @@ function stubServer() {
         return;
       }
       const bodies: Record<string, unknown> = {
-        ping: { ok: true, data: { status: "ok", protocol_version: 3, sessions: 0 } },
+        ping: { ok: true, data: { status: "ok", protocol_version: 4, sessions: 0 } },
         search_harness: { ok: true, data: { harnesses: { fake: {} } } },
+        search_template: { ok: true, data: { templates: [] } },
+        register_template: { ok: true, data: { template: (params.template as Record<string, unknown>) ?? {} } },
         create_session: { ok: true, data: { session_id: "s1", state: "ready" } },
         send_message: { ok: true, data: { message_id: "m1" } },
         cancel_message: { ok: true, data: { state: "cancelled", terminal: true } },
@@ -132,18 +134,33 @@ async function setup(hasUI = true) {
 }
 
 describe("Pi tools over the HTTP bridge", () => {
-  it("registers the eleven acp_ tools plus acp_wait and never uses MCP or a new user turn", async () => {
+  it("registers the eleven acp_ tools plus the two template tools and acp_wait, and never uses MCP or a new user turn", async () => {
     const host = await setup();
     try {
-      expect(host.tools.size).toBe(12);
+      expect(host.tools.size).toBe(14);
       expect([...host.tools.keys()]).toContain("acp_send_message");
       expect([...host.tools.keys()]).toContain("acp_wait");
+      expect([...host.tools.keys()]).toContain("acp_search_template");
+      expect([...host.tools.keys()]).toContain("acp_create_template");
       // live_output is gone and never registered.
       expect([...host.tools.keys()]).not.toContain("acp_live_output");
       expect([...host.tools.keys()].some(name => name.includes("mcp"))).toBe(false);
       const result = await host.execute("acp_ping", {});
       expect((result.details as { status: string }).status).toBe("ok");
       expect(host.messages).not.toHaveBeenCalled();
+    } finally { await host.cleanup(); }
+  });
+
+  it("routes acp_create_template to POST /api/register_template (not /api/create_template)", async () => {
+    const host = await setup();
+    try {
+      const result = await host.execute("acp_create_template", { template: { name: "t", harness: "codebuddy" } });
+      expect((result.details as { template: { name: string } }).template.name).toBe("t");
+      expect(host.state.requests).toContain("register_template");
+      expect(host.state.requests).not.toContain("create_template");
+      const found = await host.execute("acp_search_template", { name: "t" });
+      expect(found.details).toEqual({ templates: [] });
+      expect(host.state.requests).toContain("search_template");
     } finally { await host.cleanup(); }
   });
 

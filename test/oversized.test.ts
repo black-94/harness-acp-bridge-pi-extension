@@ -35,7 +35,7 @@ afterEach(async () => {
 function oversizedPayload(): Record<string, unknown> {
   return {
     status: "ok",
-    protocol_version: 3,
+    protocol_version: 4,
     business_marker: ORDINARY_MARKER,
     padding: `ordinary filler ${"P".repeat(30_000)} ${ORDINARY_MARKER}`,
     nested: {

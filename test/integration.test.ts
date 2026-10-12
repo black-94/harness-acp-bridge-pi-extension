@@ -5,7 +5,7 @@
  */
 import { createServer } from "node:net";
 import type { AddressInfo } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -57,7 +57,7 @@ describe.runIf(serverSpawningAvailable())("Pi client against a real server it st
         codex: { models: [{ id: "fake-model" }] },
       },
     }));
-    // Harness commands now come from templates or target PATH, never YAML launch settings.
+    // Harness commands come from an explicit command/args/env or the target PATH, never YAML launch settings.
     const bin = join(dir, "bin"); mkdirSync(bin);
     const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
     for (const [command, flags] of [["codebuddy", ""], ["codex-acp", "--fake-agent=codex --auth-methods"]]) {
@@ -109,6 +109,104 @@ describe.runIf(serverSpawningAvailable())("Pi client against a real server it st
     const result = await host.execute("acp_send_message", { session_id: session, text: "hello 中文😀" });
     expect(result.details!.terminal).toBe(true);
     expect((result.details!.result as { text: string }).text).toBe("echo:hello 中文😀");
+  });
+
+  // Session directories live directly under the configured state_dir.
+  const sessionDirs = (): string[] => readdirSync(join(dir, "sessions"), { withFileTypes: true })
+    .filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
+
+  it("registers and searches a template through the alias without starting a harness", async () => {
+    const before = sessionDirs();
+    const created = await host.execute("acp_create_template", { template: { name: "pi-local", harness: "codebuddy", description: "local direct", cwd: dir } });
+    // The alias returned the server's stored template with defaults applied, and no session id.
+    expect(created.details).toMatchObject({
+      template: { name: "pi-local", harness: "codebuddy", runtime: "direct", target: "local", cwd: dir, permission_mode: "auto", args: [], env: {} },
+    });
+    expect(created.details!.session_id).toBeUndefined();
+    // Registering starts no harness: no new session directory appears.
+    expect(sessionDirs()).toEqual(before);
+    // The tool posts to register_template, never a non-existent create_template endpoint.
+    const byName = await host.execute("acp_search_template", { name: "pi-local" });
+    expect((byName.details!.templates as Array<Record<string, unknown>>)[0]).toMatchObject({ name: "pi-local", cwd: dir, mounts: [], ports: [] });
+    const byQuery = await host.execute("acp_search_template", { query: "PI-LOCAL" });
+    expect((byQuery.details!.templates as Array<{ name: string }>).map(t => t.name)).toContain("pi-local");
+    const byHarness = await host.execute("acp_search_template", { harness: "codebuddy" });
+    expect((byHarness.details!.templates as Array<{ name: string }>).map(t => t.name)).toContain("pi-local");
+    // Searching also starts nothing.
+    expect(sessionDirs()).toEqual(before);
+  });
+
+  it("rejects a duplicate template name instead of overwriting it", async () => {
+    await expect(host.execute("acp_create_template", { template: { name: "pi-local", harness: "codebuddy", description: "changed" } }))
+      .rejects.toMatchObject({ code: "template_exists" });
+    const found = await host.execute("acp_search_template", { name: "pi-local" });
+    expect((found.details!.templates as Array<{ description: string }>)[0]!.description).toBe("local direct");
+  });
+
+  it("expands a searched template into explicit create_session parameters (no template/meta) and honors a cwd override", async () => {
+    const overrideDir = join(dir, "override-cwd");
+    mkdirSync(overrideDir, { recursive: true });
+    // LLM-style expansion: read the template, hand-pick only the fields create_session accepts.
+    const t = ((await host.execute("acp_search_template", { name: "pi-local" })).details!.templates as Array<Record<string, unknown>>)[0]!;
+    const expand = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+      harness: t.harness, runtime: t.runtime, target: t.target, permission_mode: t.permission_mode,
+      command: t.command, args: t.args, env: t.env, cwd: t.cwd, ...overrides,
+    });
+    for (const forbidden of ["template", "name", "description"]) expect(expand({})).not.toHaveProperty(forbidden);
+
+    const inherited = await host.execute("acp_create_session", { ...expand({}), model_id: "fake-model" });
+    expect(inherited.details!.cwd).toBe(dir);
+    expect(inherited.details!.template).toBeUndefined();
+    const result = await host.execute("acp_send_message", { session_id: inherited.details!.session_id as string, text: "via-expansion" });
+    expect((result.details!.result as { text: string }).text).toBe("echo:via-expansion");
+    await host.execute("acp_close_session", { session_id: inherited.details!.session_id as string });
+
+    const overridden = await host.execute("acp_create_session", { ...expand({ cwd: overrideDir }), model_id: "fake-model" });
+    expect(overridden.details!.cwd).toBe(overrideDir);
+    expect(overridden.details!.cwd).not.toBe(dir);
+    await host.execute("acp_close_session", { session_id: overridden.details!.session_id as string });
+  });
+
+  it("runs a fake harness with the command/args/env expanded from a template", async () => {
+    const promptFile = join(dir, "expanded-prompts.txt");
+    await host.execute("acp_create_template", { template: { name: "pi-rich", harness: "codebuddy", command: process.execPath, args: [fakeHarness], env: { FAKE_HARNESS_PROMPT_FILE: promptFile }, cwd: dir } });
+    const found = ((await host.execute("acp_search_template", { name: "pi-rich" })).details!.templates as Array<Record<string, unknown>>)[0]!;
+    expect(found).toMatchObject({ command: process.execPath, args: [fakeHarness], env: { FAKE_HARNESS_PROMPT_FILE: promptFile } });
+    const session = (await host.execute("acp_create_session", {
+      harness: found.harness, runtime: found.runtime, target: found.target, command: found.command,
+      args: found.args, env: found.env, cwd: found.cwd, model_id: "fake-model",
+    })).details!.session_id as string;
+    const status = await host.execute("acp_send_message", { session_id: session, text: "expanded-env" });
+    expect((status.details!.result as { text: string }).text).toBe("echo:expanded-env");
+    // The env reached the harness (it recorded the prompt), proving command+args+env were applied.
+    expect(readFileSync(promptFile, "utf8")).toContain("expanded-env");
+    await host.execute("acp_close_session", { session_id: session });
+  });
+
+  it("round-trips a searched Docker template under a new name (null host_ip)", async () => {
+    await host.execute("acp_create_template", { template: {
+      name: "pi-docker-rt", harness: "codebuddy", runtime: "docker", docker_image: "example:latest", cwd: "/workspace",
+      ports: [{ host_port: 8080, container_port: 8080, protocol: "tcp", host_ip: null }],
+      mounts: [{ source: "/host/repo", target: "/workspace", read_only: false }],
+    } });
+    const searched = (await host.execute("acp_search_template", { name: "pi-docker-rt" })).details!.templates as Array<Record<string, unknown>>;
+    expect((searched[0]!.ports as Array<Record<string, unknown>>)[0]).toMatchObject({ host_port: 8080, protocol: "tcp", host_ip: null });
+    const renamed = await host.execute("acp_create_template", { template: { ...searched[0], name: "pi-docker-rt-2" } });
+    expect(renamed.details!.template).toMatchObject({ name: "pi-docker-rt-2", docker_image: "example:latest", runtime: "docker" });
+  });
+
+  it("rejects a template reference, launch internals, and an invalid template", async () => {
+    // create_session never references a template: naming one is an unsupported parameter.
+    await expect(host.execute("acp_create_session", { template: "pi-local", model_id: "fake-model" }))
+      .rejects.toMatchObject({ code: "unknown_param" });
+    await expect(host.execute("acp_create_session", { cwd: dir, model_id: "fake-model", session_dir: "/tmp/x" }))
+      .rejects.toMatchObject({ code: "launch_internal" });
+    await expect(host.execute("acp_create_template", { template: { name: "pi-bad-docker", harness: "codebuddy", docker_image: "img:1" } }))
+      .rejects.toMatchObject({ code: "invalid_template" });
+  });
+
+  it("rejects a create_session without cwd at the server", async () => {
+    await expect(host.execute("acp_create_session", { model_id: "fake-model" })).rejects.toMatchObject({ code: "invalid_param" });
   });
 
   it("keeps the turn running until a permission popup is answered", async () => {

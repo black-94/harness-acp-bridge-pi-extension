@@ -104,6 +104,24 @@ describe("managed local server lifecycle", () => {
     expect((await response.json() as { ok: boolean }).ok).toBe(true);
   });
 
+  it("refuses a still-running protocol-3 daemon without restarting or killing it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-acp-life-"));
+    const port = await freePort();
+    // The previous public contract: an occupied listener on protocol 3 must be refused, never
+    // taken over, restarted, or killed by the client.
+    const listener: Server = createHttp((_request, response) => { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ ok: true, data: { status: "ok", protocol_version: 3, pid: process.pid } })); });
+    await new Promise<void>(r => listener.listen(port, "127.0.0.1", () => r()));
+    cleanups.push(() => new Promise<void>(r => listener.close(() => r())));
+    const clientDir = join(dir, "client");
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const lifecycle = new ServerLifecycle(settings(`http://127.0.0.1:${port}`), { ...process.env, HARNESS_ACP_BRIDGE_CLIENT_DIR: clientDir });
+    expect(await lifecycle.probe()).toBe("incompatible");
+    await expect(lifecycle.ensure()).rejects.toMatchObject({ code: "incompatible_server" });
+    expect(registry(clientDir)).toEqual({});
+    const response = await fetch(`http://127.0.0.1:${port}/api/ping`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    expect((await response.json() as { ok: boolean }).ok).toBe(true);
+  });
+
   it.runIf(serverSpawningAvailable())("does not run an inherited SERVER_COMMAND when an explicit module entry is selected", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-acp-life-"));
     const clientDir = join(dir, "client");
