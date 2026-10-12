@@ -103,14 +103,21 @@ function strictUtf8(buffer) {
  * kept in memory only and never written to disk.
  */
 export class Redactor {
-    secrets;
-    constructor(secrets = []) { this.secrets = normalizeSecrets(secrets); }
-    text(value) { return redactText(value, this.secrets); }
-    value(value) { return redactValue(value, this.secrets); }
-    bytes(buffer) { return redactBytes(buffer, this.secrets); }
+    secretList;
+    constructor(secrets = []) { this.secretList = normalizeSecrets(secrets); }
+    get secrets() { return this.secretList; }
+    /**
+     * Register additional literal secret values discovered at runtime (e.g. an auth answer's token).
+     * Masking is by value, so it is scoped to the real bytes without over-redacting ordinary fields
+     * that merely share a name such as `code`/`response`.
+     */
+    addSecrets(values) { this.secretList = normalizeSecrets([...this.secretList, ...values]); }
+    text(value) { return redactText(value, this.secretList); }
+    value(value) { return redactValue(value, this.secretList); }
+    bytes(buffer) { return redactBytes(buffer, this.secretList); }
     /** A bounded, cross-chunk redactor for streamed diagnostics (stderr, oversized fragments). */
     stream(charset = "utf8") {
-        return new StreamRedactor(this.secrets, charset);
+        return new StreamRedactor(this.secretList, charset);
     }
 }
 // ---------------------------------------------------------------------------

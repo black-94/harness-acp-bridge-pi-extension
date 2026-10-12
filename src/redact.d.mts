@@ -15,8 +15,15 @@ export declare function redactBytes(buffer: Buffer, secrets: readonly string[]):
  * kept in memory only and never written to disk.
  */
 export declare class Redactor {
-    readonly secrets: readonly string[];
+    private secretList;
     constructor(secrets?: readonly string[]);
+    get secrets(): readonly string[];
+    /**
+     * Register additional literal secret values discovered at runtime (e.g. an auth answer's token).
+     * Masking is by value, so it is scoped to the real bytes without over-redacting ordinary fields
+     * that merely share a name such as `code`/`response`.
+     */
+    addSecrets(values: readonly string[]): void;
     text(value: string): string;
     value<T>(value: T): T;
     bytes(buffer: Buffer): Buffer;
