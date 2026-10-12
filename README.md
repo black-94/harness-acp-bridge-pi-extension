@@ -180,14 +180,14 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 - `servers.json` 在原子写入前先脱敏；顶层 map key 是 baseUrl（本身已校验无凭据）并原样保留，
   保证 registry 与所有权探测可用。日志文件为 0600、位于 0700 客户端目录，launcher proof 文件 0600。
 - 规则来自 server 的规范源文件：`src/redact-core.mjs` / `src/redact.mjs` 由
-  `server/src/redact-core.ts`（sha256 `b07ef16e39483b008c0f03e3da05dc194c87fa93080b53accf34317586d2a6c8`）
-  与 `server/src/redact.ts`（sha256 `fa8e4bfedee21dd2c8014544cb8a9daacf8378c83fba874a8ad1714cf7fa450f`）
+  `server/src/redact/redact-core.ts`（sha256 `b07ef16e39483b008c0f03e3da05dc194c87fa93080b53accf34317586d2a6c8`）
+  与 `server/src/redact/redact.ts`
   经 `tsc` 转译得到，**唯一改动是把内部 `./redact-core.js` import 改成 `.mjs`**；`redact-core.d.mts` /
   `redact.d.mts` 同为生成的声明。无运行时跨仓库 import，普通 Node（>=20.11）直接运行、无需 TS loader。
   重新同步：对 server 的两个 TS 跑 `tsc --outDir <tmp> --target ES2022 --module ES2022
   --moduleResolution node --declaration`，把 `redact-core.js`/`redact.js` 的 `.js` 改为 `.mjs` 后拷入 `src/`。
-- 跨包 parity harness（仓库根 `scripts/tests/redaction-parity.mjs`）同时加载 server、MCP、Pi 三个模块，
-  对非流式与流式 API 做逐字节一致性校验（报告：`/tmp/redaction-parity-final.log`）。
+- parity harness（`npm run parity`）加载本包与同级 server 构建，对非流式与流式 API 做逐字节一致性校验
+  （报告：`/tmp/redaction-parity-pi.log`）。MCP 客户端以同一份 server 构建做同样的校验，因此三端传递一致。
 - 只识别常见敏感字段/正文凭据：未知/未识别文本（含 `max_tokens` 这类计数、普通中文/emoji）
   原样保留；不保证清除所有未知秘密。
 - 超大 toolResult（>20000 字符）落盘前递归脱敏：临时目录 700、结果文件 600；内存中返回给模型

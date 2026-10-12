@@ -45,6 +45,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "parity": "node scripts/redaction-parity.mjs",
     "dev:setup": "npm ci --ignore-scripts && npm run fix:dev-deps",
     "fix:dev-deps": "node scripts/fix-dev-dependencies.mjs",
     "check": "npm run typecheck && npm test",
