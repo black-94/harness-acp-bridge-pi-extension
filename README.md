@@ -50,19 +50,57 @@ HARNESS_ACP_BRIDGE_CONFIG=/absolute/path/to/config.yaml pi
 
 `PI_CODING_AGENT_DIR` 可替换全局 agent 目录。
 
+**配置优先级：环境变量 > JSON 配置 > 内置默认值**（与 MCP 代理一致）。两端共用
+`HARNESS_ACP_BRIDGE_URL` / `_AUTOSTART` / `_SERVER_ENTRY` / `_CONFIG` / `_STARTUP_TIMEOUT_MS` /
+`_TIMEOUT_MS`；各自保留自己的默认超时值，Pi 仍保留上面的全局/项目/显式 JSON 选址规则。
+
 | 字段 | 默认值 | 用途 |
 | --- | --- | --- |
 | `baseUrl` | `http://127.0.0.1:8787` | 服务端地址；仅 `http`/`https`，不含凭据、查询串或片段 |
 | `requestTimeoutMs` | `900000` | 单次 HTTP 请求超时，需覆盖创建 / 认证的耗时 |
-| `interactionTimeoutMs` | `60000` | 每个交互问题的超时 |
-| `pollIntervalMs` | `500` | 状态 / 输出轮询间隔 |
+| `interactionTimeoutMs` | `60000` | 每个交互问题的超时（Pi 专属，无共用环境变量） |
+| `pollIntervalMs` | `500` | 状态 / 输出轮询间隔（Pi 专属，无共用环境变量） |
 | `autoStart` | `true` | 服务不可达时是否按需启动本地服务 |
-| `serverEntry` | 已安装依赖 | 启动本地服务时加载的 server 模块或路径。相对路径按 `ctx.cwd` 解析，`file:` URL 原样使用；必须指向导出 `HarnessHttpServer`/`loadConfig` 的 server 入口，**不是** `dist/main.js` 之类的 CLI |
+| `serverEntry` | — | 显式指定启动本地服务时加载的 **server 模块**（或路径 / `file:` URL）。相对路径按 `ctx.cwd` 解析；必须导出 `HarnessHttpServer`/`loadConfig` 的 server 入口（包 `index`），**不是** `hacpd`（`dist/main.js`）这类 CLI。一旦设置即为最终选择：绝不静默忽略，也不回退探测 PATH/依赖 |
 | `configPath` | 环境变量 / 默认 | 传给所启动服务的 YAML 配置路径 |
 | `startupTimeoutMs` | `30000` | 等待所启动服务响应 `ping` 的上限 |
 
+**共用的环境变量（env 覆盖 JSON 与默认值）：**
+
+| 环境变量 | 覆盖字段 | 默认 |
+| --- | --- | --- |
+| `HARNESS_ACP_BRIDGE_URL` | `baseUrl` | `http://127.0.0.1:8787` |
+| `HARNESS_ACP_BRIDGE_AUTOSTART` | `autoStart` | `true` |
+| `HARNESS_ACP_BRIDGE_SERVER_ENTRY` | `serverEntry` | — |
+| `HARNESS_ACP_BRIDGE_CONFIG` | `configPath` | 环境变量 / 默认 |
+| `HARNESS_ACP_BRIDGE_TIMEOUT_MS` | `requestTimeoutMs` | `900000` |
+| `HARNESS_ACP_BRIDGE_STARTUP_TIMEOUT_MS` | `startupTimeoutMs` | `30000` |
+
+> **超时对应键**：MCP 的 `timeoutMs`（env `HARNESS_ACP_BRIDGE_TIMEOUT_MS`）对应 Pi 的
+> `requestTimeoutMs`（同一个 env）；`startupTimeoutMs`（env `HARNESS_ACP_BRIDGE_STARTUP_TIMEOUT_MS`）
+> 两端同名同 env。Pi 的 `interactionTimeoutMs`/`pollIntervalMs` 为 Pi 专属 JSON，暂无共用 env。
+
 **不接受 `command`/`args`/`env`/`cwd` 等启动透传字段**：扩展只连接服务，不注入命令或环境。
-未知字段直接报错，不静默忽略。`HARNESS_ACP_BRIDGE_CONFIG` 仍被沿用为服务端配置路径。
+未知字段直接报错，不静默忽略。`HARNESS_ACP_BRIDGE_CONFIG` 仍被沿用为服务端配置路径（且 env 优先于 JSON）。
+
+### 本地服务入口选择
+
+需要本地启动服务时，入口按以下顺序确定：
+
+1. `HARNESS_ACP_BRIDGE_SERVER_ENTRY` / JSON `serverEntry`——可导入的 server **模块**，显式且最终；
+   值错误则 `startup_failed`，绝不静默跳过。
+2. `PATH` 上的 `hacpd`（固定名探测，绝非调用方提供的命令）。标准 npm 全局安装是 `.bin` 指向包内
+   `dist/main.js` 的 symlink；扩展会解析该 symlink，并因 CLI 在同一进程内启动服务且**不读取 stdin**，
+   用 `node --import <内置 watchdog> <hacpd>` 启动，使得子进程 PID 就是应答 `ping` 的服务 PID
+   （精确所有权证明），且 supervisor 退出（含 `SIGKILL`）会以 stdin EOF 传递到服务并停止它而不是
+   遗留孤儿；真实脚本自身的模块解析保持不变。
+3. 否则使用已安装依赖 `@black942026/harness-acp-bridge-server` 的模块入口。
+
+**不是 Node 脚本**的 `hacpd`（其它 shebang，如 shell wrapper）无法携带进程内 watchdog 或给出精确
+PID，因此明确 `startup_failed`（日志中会说明支持布局）而绝不冒险运行。找到 `hacpd` 但启动后始终不
+应答 `ping`、或应答不兼容，同样硬失败——**启动失败后绝不切换到下一个入口**。`PATH` 中的空分量表示
+cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解析；**未设置 `PATH` 时完全不探测
+`hacpd`**（绝不会把未设置当作 cwd），因此项目内的 `hacpd` 不会被误运行。
 
 > **迁移**：旧版本用 `command`/`args`/`env` 指定如何 `spawn` 服务端 CLI。这些字段已移除且会被
 > 拒绝；请改为配置 `baseUrl`（并按需 `autoStart`/`serverEntry`/`configPath`）。旧的 socket

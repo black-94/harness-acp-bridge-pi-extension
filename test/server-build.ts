@@ -29,6 +29,18 @@ export function newContractServerEntry(): string | null {
   return null;
 }
 
+/**
+ * The `hacpd` CLI of a protocol-3 build (`dist/main.js`), for exercising the PATH-command launch
+ * path. Returns null when no protocol-3 build is present (the command suites then skip).
+ */
+export function newContractServerCli(): string | null {
+  const repo = join(serverDir, "dist");
+  if (distIsProtocol3(repo) && existsSync(join(repo, "main.js"))) return join(repo, "main.js");
+  const installed = join(here, "..", "node_modules", "@black942026", "harness-acp-bridge-server", "dist");
+  if (distIsProtocol3(installed) && existsSync(join(installed, "main.js"))) return join(installed, "main.js");
+  return null;
+}
+
 /** True when a server with the new contract can actually be started for an integration test. */
 export function serverSpawningAvailable(): boolean {
   return existsSync(fakeHarness) && newContractServerEntry() !== null;
