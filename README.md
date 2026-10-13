@@ -379,6 +379,7 @@ npm audit --omit=dev
 npm pack --dry-run
 ```
 
+本包及其测试不导入 MCP 客户端，不需要 MCP 检出或安装其依赖。
 默认 `npm test` 完全自包含（不依赖相邻 `../pi-ask-user` 检出）：反向交互参数用
 `test/ask-user-contract.ts`（pi-ask-user `AskUserParams` 的严格镜像）校验。若需用真实 normalizer
 复核，额外检出 `../pi-ask-user` 后运行 `npm run test:protocol`（属 `test/protocol/`，不进入默认

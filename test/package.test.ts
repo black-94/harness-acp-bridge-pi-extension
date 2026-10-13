@@ -23,6 +23,8 @@ describe("Pi package entry point", () => {
   it("depends on the HTTP server package and carries no MCP dependency", () => {
     expect(manifest.dependencies["@black942026/harness-acp-bridge-server"]).toBeDefined();
     expect(manifest.dependencies["@modelcontextprotocol/sdk"]).toBeUndefined();
+    expect(manifest.dependencies["@black942026/harness-acp-bridge-mcp"]).toBeUndefined();
+    expect(manifest.devDependencies["@black942026/harness-acp-bridge-mcp"]).toBeUndefined();
     // The server dependency is the HTTP five-layer server (exports HarnessHttpServer), not the
     // old socket daemon; the bootstrap imports its root export and never a deep CLI path.
     const server = JSON.parse(readFileSync(new URL("../node_modules/@black942026/harness-acp-bridge-server/package.json", import.meta.url), "utf8"));
