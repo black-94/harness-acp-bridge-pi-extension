@@ -74,7 +74,6 @@ function stubServer() {
       }
       const bodies: Record<string, unknown> = {
         ping: { ok: true, data: { status: "ok", protocol_version: 4, sessions: 0 } },
-        search_harness: { ok: true, data: { harnesses: { fake: {} } } },
         search_template: { ok: true, data: { templates: [] } },
         register_template: { ok: true, data: { template: (params.template as Record<string, unknown>) ?? {} } },
         create_session: { ok: true, data: { session_id: "s1", state: "ready" } },
@@ -134,10 +133,11 @@ async function setup(hasUI = true) {
 }
 
 describe("Pi tools over the HTTP bridge", () => {
-  it("registers the eleven acp_ tools plus the two template tools and acp_wait, and never uses MCP or a new user turn", async () => {
+  it("registers ten acp_ tools plus two template tools and acp_wait, and never uses MCP or a new user turn", async () => {
     const host = await setup();
     try {
-      expect(host.tools.size).toBe(14);
+      expect(host.tools.size).toBe(13);
+      expect([...host.tools.keys()]).not.toContain("acp_search_harness");
       expect([...host.tools.keys()]).toContain("acp_send_message");
       expect([...host.tools.keys()]).toContain("acp_wait");
       expect([...host.tools.keys()]).toContain("acp_search_template");

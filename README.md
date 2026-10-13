@@ -128,8 +128,8 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 
 ## 工具
 
-注册 11 个 `acp_` 工具（与服务端同名）加两个模板工具、`acp_wait`：`acp_ping`、
-`acp_search_harness`、`acp_search_template`、`acp_create_template`、`acp_create_session`、
+注册 10 个 `acp_` 工具（与服务端同名）加两个模板工具、`acp_wait`：`acp_ping`、
+`acp_search_template`、`acp_create_template`、`acp_create_session`、
 `acp_close_session`、`acp_authenticate`、`acp_auth_status`、`acp_set_session_options`、
 `acp_send_message`、`acp_cancel_message`、`acp_message_status`、`acp_answer_question`，
 外加上面的 `acp_wait`。
@@ -150,6 +150,7 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 
 ### 启动模板
 
+`search_harness` 接口和 `acp_search_harness` 工具已移除，请使用模板或显式会话参数选择 harness。
 模板只是**信息**，由服务端持久存储；`acp_create_session` **不再**接受模板引用。本扩展只暴露两个工具：
 
 - **`acp_search_template`**：按精确 `name`、`query`（name/harness/description 的大小写不敏感子串）
@@ -158,15 +159,52 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
   的**客户端别名**（不会 `POST /api/create_template`，也不暴露删除）。**不创建会话、不启动 harness**；
   重名返回 `template_exists`，绝不覆盖。注册前请按 `acp-create-template` skill 收集信息并与用户确认。
 
-推荐工作流：用户指定模板 → `acp_search_template` 精确搜索（有歧义就让用户选择）→ 读返回内容 →
-**丢弃** `name`/`description` 与不适用字段（例如 direct 会话丢弃全部 Docker 字段）→ 收集模板未提供的
-`model_id`（模板不含模型/思考级别）、可能缺失的 `cwd` 与任何用户覆盖项 → 用这些**显式字段**调用
-`acp_create_session`（`cwd` 与 `model_id` 必填）。模板中值为 `null` 且对会话非法的字段要**省略**而非传
-`null`（例如 local 模板的 `remote_host: null`，`remote_host` 仅 remote 会话传；`cwd` 为 `null` 时改用用户的
-`cwd`）。**绝不**向 `create_session` 传 `template`/`name`/`description`
-（严格 schema 会拒绝）。覆盖 `runtime`/`target` 后需重新检查组合（Docker 字段要求 `runtime: docker`；remote
-目标需要 `remote_host`）。`command`/`args`/`env`/`login_dirs` 现在都是允许的显式会话参数；合并与校验由服务端完成，
-客户端不实现第二套默认值合并。
+模板新增五个可选字段（默认 `null`）：
+
+- `model`：默认模型 ID，展开为会话 `model_id`。
+- `thinking`：默认思维强度，展开为会话 `thinking_level`；不写死候选值，交由实际 ACP 校验。
+- `before_start`：ACP 启动前动作的自然语言提示。
+- `after_start`：ACP 成功启动并完成必要认证后的动作提示。
+- `special_instructions`：整个工作流应遵循的特殊提示。
+
+后三个字段由**调用方 LLM 用自己的工具执行**，不是服务端/扩展自动执行的脚本 hook；创建和搜索模板不会执行它们。
+需要审批的操作仍要用户确认；动作失败或工具不可用时报告阻塞，不得假装已执行。
+
+推荐工作流：精确搜索模板并读完整内容 → 将非 null `model`/`thinking` 映射到会话参数（用户覆盖优先），
+仅询问缺失的模型或 `cwd` → 遵循特殊提示并执行启动前动作 → 用**显式允许字段**创建会话 → 完成必要认证 →
+执行启动后动作 → 发送正常工作。Docker 的 `network_mode` 映射为会话 `host_network`（host 为 true，
+none/proxy 为 false），透传返回的完整 env。**丢弃** `name`/`description`/`model`/`thinking`/`network_mode`/
+`proxy_port`/`before_start`/`after_start`/
+`special_instructions` 和不适用字段；绝不向 `create_session` 传模板引用或模板专用字段。
+对会话非法的 null 要省略（例如 local `remote_host`、缺失的 `cwd`），覆盖 runtime/target 后重新检查组合。
+客户端不实现第二套模板默认值合并。
+
+**配置迁移**：从服务端 YAML 删除整个旧 `harnesses` 段（含模型/思维强度候选与描述）。
+`codebuddy`、`codex`、`agy` 内置 adapter 无需声明即可使用，由模板或显式会话参数选择；未传 harness 时
+使用 `default_harness`（默认 Codex）。所有服务设置使用默认值时无需 YAML 文件。
+模型/思维强度默认值放在模板或显式会话参数中，已有模板缺失五个新字段时自动补 null。
+
+### Docker 网络三选一
+
+模板改用 `network_mode: none | host | proxy`，不兼容旧模板 `host_network` 字段：
+
+- `none`（默认）：普通 Docker 桥接网络，不配置代理。
+- `host`：宿主机网络，不配置代理或发布端口。
+- `proxy`：普通桥接网络，只填 `proxy_port`（1–65535），代理实现不限 Xray。
+
+proxy 模式由服务端在注册时生成：
+
+```text
+http_proxy  = http://host.docker.internal:PORT
+https_proxy = http://host.docker.internal:PORT
+no_proxy    = localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local,.internal
+```
+
+自动替换旧的大小写代理变量，保留其他 env。不再分别询问 HTTP/HTTPS 地址或绕过列表。
+启动时 LLM 将返回的 env 透传给会话，`network_mode`/`proxy_port` 不是会话参数。
+宿主机地址需从执行目标的容器内验证；Linux 可能需要 host-gateway 配置，不自动修改网络或代理服务。
+HTTP 客户端需要支持这些环境变量及 CIDR 绕过规则，env 成功透传不等于代理已连通。
+旧模板需重新注册，无自动兼容迁移。
 
 ### acp-create-template skill
 
@@ -174,9 +212,11 @@ cwd，相对分量按客户端启动时的 cwd（而非 supervisor 的 cwd）解
 [`skills/acp-create-template/SKILL.md`](skills/acp-create-template/SKILL.md)（通过
 `package.json` 的 `pi.skills` 声明，随 npm 包打包）。它指导模型**条件式**收集 `name`/`harness`、
 运行位置（local/remote/remote_host）、direct/Docker、`permission_mode`，可选的 `cwd`/`command`/`args`/
-`env`，以及 Docker 的 image/login_dirs/mounts/ports/network/container_policy；不询问不适用的参数，不索取
+`env`，可选的 `model`/`thinking` 默认值与三个自然语言提示，以及 Docker 的
+image/login_dirs/mounts/ports/network/container_policy；不询问不适用的参数，不索取
 密码/token/secret，明确持久化 `env` 的风险，重名不静默覆盖，创建前展示摘要取得确认，取消/超时/UI 不可用
-时不编造答案；并说明 `model_id` 不属于模板、创建模板不会启动会话。MCP 宿主可按 Agent Skills 规范直接加载
+时不编造答案；并说明模板 `model`/`thinking` 要映射为会话字段，创建模板不会启动会话或执行动作提示。
+MCP 宿主可按 Agent Skills 规范直接加载
 同一目录（`SKILL.md` 是纯 Markdown，无需 Pi 运行时），对应的可执行工具是 bare `create_template`。
 
 ## 认证

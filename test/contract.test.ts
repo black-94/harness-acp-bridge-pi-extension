@@ -15,12 +15,13 @@ const spec = (name: BridgeMethod) => TOOL_SPECS.find(tool => tool.name === name)
 const accepts = (name: BridgeMethod, value: unknown): boolean => ajv.compile(spec(name).parameters as object)(value as never) === true;
 
 describe("Pi tool contract", () => {
-  it("exposes the eleven operations plus the two template tools and acp_wait", () => {
-    expect(TOOL_SPECS).toHaveLength(13);
+  it("exposes ten operations plus two template tools and acp_wait, without search_harness", () => {
+    expect(TOOL_SPECS).toHaveLength(12);
+    expect(TOOL_SPECS.map(tool => tool.name)).not.toContain("search_harness");
     expect(TOOL_SPECS.map(tool => tool.name)).not.toContain("live_output" as never);
     expect(TOOL_SPECS.map(tool => tool.name).sort()).toEqual([
       "answer_question", "auth_status", "authenticate", "cancel_message", "close_session", "create_session",
-      "create_template", "message_status", "ping", "search_harness", "search_template",
+      "create_template", "message_status", "ping", "search_template",
       "send_message", "set_session_options",
     ]);
     expect(WAIT_SCHEMA).toBeDefined();
@@ -58,7 +59,7 @@ describe("Pi tool contract", () => {
     expect(props).not.toContain("template");
     expect(root.required).toEqual(expect.arrayContaining(["model_id", "cwd"]));
     expect(root.anyOf).toBeUndefined();
-    // cwd and model_id are both required; neither can be supplied by a template.
+    // cwd and model_id remain explicit even when the caller maps template defaults.
     expect(accepts("create_session", { cwd: "/repo", model_id: "m" })).toBe(true);
     expect(accepts("create_session", { model_id: "m" })).toBe(false);
     expect(accepts("create_session", { cwd: "/repo" })).toBe(false);
@@ -70,7 +71,7 @@ describe("Pi tool contract", () => {
     expect(accepts("create_session", { cwd: "/repo", model_id: "m", command: null })).toBe(true);
     expect(accepts("create_session", { cwd: "/repo", model_id: "m", command: "" })).toBe(true);
     // The launch executable is caller-supplied now; the remaining internals stay server-owned.
-    for (const forbidden of ["template", "name", "description"]) {
+    for (const forbidden of ["template", "name", "description", "model", "thinking", "network_mode", "proxy_port", "before_start", "after_start", "special_instructions"]) {
       expect(accepts("create_session", { cwd: "/repo", model_id: "m", [forbidden]: "x" })).toBe(false);
     }
     for (const internal of ["session_dir", "state_dir", "ssh_command"]) {
@@ -128,7 +129,7 @@ describe("Pi tool contract", () => {
         login_dirs: [{ source: "/a", target: "/b", read_only: true }],
         mounts: [{ source: "/c", target: "/d" }],
         ports: [{ host_port: 1, container_port: 2, protocol: "udp", host_ip: "127.0.0.1" }],
-        host_network: false,
+        network_mode: "none",
       },
     })).toBe(true);
     // Nullable fields accept null; enums are validated.
@@ -142,9 +143,47 @@ describe("Pi tool contract", () => {
     expect(accepts("create_template", { template: { name: "t", harness: "nope" } })).toBe(false);
     expect(accepts("create_template", { template: { name: "t", harness: "codebuddy", runtime: "vm" } })).toBe(false);
     // Unknown template fields are rejected, including launch internals the server owns.
-    for (const extra of ["docker_id", "session_dir", "ssh_host", "container_record_id"]) {
+    for (const extra of ["host_network", "docker_id", "session_dir", "ssh_host", "container_record_id"]) {
       expect(accepts("create_template", { template: { name: "t", harness: "codebuddy", [extra]: "x" } })).toBe(false);
     }
+  });
+
+  it("accepts none/host/proxy with one port, rejects legacy/conflicting modes and validates session proxy conflicts", () => {
+    const base = { name: "network", harness: "codex", runtime: "docker", docker_image: "image" };
+    for (const network_mode of ["none", "host"]) expect(accepts("create_template", { template: { ...base, network_mode } })).toBe(true);
+    expect(accepts("create_template", { template: { ...base, network_mode: "proxy", proxy_port: 12345 } })).toBe(true);
+    for (const extra of [{ network_mode: "invalid" }, { host_network: false }, { network_mode: "proxy" },
+      { network_mode: "proxy", proxy_port: null }, { network_mode: "host", proxy_port: 12345 },
+      { network_mode: "none", env: { http_proxy: "http://proxy:1" } }, { network_mode: "host", ports: [{ host_port: 1, container_port: 2 }] },
+      { runtime: "direct", network_mode: "proxy", proxy_port: 12345 }]) {
+      expect(accepts("create_template", { template: { ...base, ...extra } })).toBe(false);
+    }
+    for (const proxy_port of [0, 65536, 1.5, "12345"]) expect(accepts("create_template", { template: { ...base, network_mode: "proxy", proxy_port } })).toBe(false);
+    for (const key of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+      expect(accepts("create_session", { cwd: "/w", model_id: "m", runtime: "docker", docker_image: "i", host_network: true, env: { [key]: "http://proxy:1" } })).toBe(false);
+    }
+    expect(accepts("create_session", { cwd: "/w", model_id: "m", runtime: "docker", docker_image: "i", host_network: true, env: { http_proxy: "", no_proxy: "localhost" } })).toBe(true);
+    expect(spec("create_template").description).toContain("proxy_port");
+    expect(spec("create_session").description).toContain("network_mode and proxy_port are template-only");
+  });
+
+  it("accepts optional model/thinking defaults and natural-language LLM guidance", () => {
+    const base = { name: "guided", harness: "codebuddy" };
+    const fields = { model: "custom-model", thinking: "custom-effort", before_start: "启动前检查目录。\n确认依赖。",
+      after_start: "启动后检查状态。", special_instructions: "遵循用户指示 😀" };
+    expect(accepts("create_template", { template: { ...base, ...fields } })).toBe(true);
+    for (const field of Object.keys(fields)) {
+      expect(accepts("create_template", { template: { ...base, [field]: null } })).toBe(true);
+      for (const value of [123, [], "bad\0text"]) expect(accepts("create_template", { template: { ...base, [field]: value } })).toBe(false);
+    }
+    for (const field of ["model", "thinking"]) {
+      for (const value of ["", " \n "]) expect(accepts("create_template", { template: { ...base, [field]: value } })).toBe(false);
+    }
+    for (const name of ["search_template", "create_session"] as const) {
+      for (const field of ["before_start", "after_start", "special_instructions"]) expect(spec(name).description).toContain(field);
+    }
+    expect(spec("create_session").description).toContain("model to model_id");
+    expect(spec("create_session").description).toContain("thinking to thinking_level");
   });
 
   it("answer_question makes message_id optional (session-scoped auth answers)", () => {
